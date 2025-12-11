@@ -71,12 +71,13 @@ class OnyxHopeSmallConfig:
     memory_type: str = "linear"
     use_delta_rule: bool = True
     normalize_keys: bool = True
-    memory_lr_init: float = 0.1
+    memory_lr_init: float = 0.05       # Reduced from 0.1 for stability
     memory_lr_learnable: bool = True
-    memory_decay_init: float = 0.95
+    memory_decay_init: float = 0.9     # Reduced from 0.95 for faster forgetting
     memory_decay_learnable: bool = True
-    max_memory_lr: float = 0.5
+    max_memory_lr: float = 0.2         # Reduced from 0.5 for stability
     min_memory_decay: float = 0.5
+    memory_max_norm: float = 15.0      # NEW: Cap memory norm to prevent explosion
 
     # === Nested Learning: CMS FFN ===
     use_cms_ffn: bool = True
@@ -198,6 +199,12 @@ class LinearDeltaMemory(nn.Module):
         else:
             # Hebbian: M' = alpha*M + eta*v*k^T
             M_new = self.alpha * M + self.eta * torch.matmul(v, k.transpose(-1, -2))
+
+        # STABILITY FIX: Cap memory norm to prevent explosion
+        M_norm = torch.norm(M_new, dim=(-2, -1), keepdim=True)
+        max_norm = self.config.memory_max_norm
+        scale = torch.clamp(max_norm / (M_norm + 1e-6), max=1.0)
+        M_new = M_new * scale
 
         return M_new
 
