@@ -7,8 +7,6 @@ checkpoints/
 
 # Datasets
 *.jsonl
-*.json
-!package.json
 data/
 
 # Python

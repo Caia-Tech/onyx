@@ -1,0 +1,34 @@
+{
+    "name": "onyx-80m",
+    "version": "1.0",
+    "total_params": 81221052,
+    "core_params": 32136252,
+    "embedding_params": 49084800,
+
+    "architecture": {
+        "d_model": 384,
+        "n_layers": 6,
+        "n_heads": 6,
+        "n_kv_heads": 2,
+        "d_ff": 4096,
+        "vocab_size": 127872,
+        "max_seq_len": 8192,
+        "rope_theta": 500000.0,
+        "norm_eps": 1e-5
+    },
+
+    "memory": {
+        "memory_size": 2048,
+        "memory_heads": 4,
+        "beta_init": 0.9
+    },
+
+    "training": {
+        "recommended_batch_size": 16,
+        "recommended_seq_len": 2048,
+        "tokens_per_step": 32768,
+        "dtype": "float32"
+    },
+
+    "notes": "Base model. Trained on ~102M tokens."
+}

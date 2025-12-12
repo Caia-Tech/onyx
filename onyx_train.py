@@ -131,6 +131,8 @@ class TrainingConfig:
     save_every_steps: int = 0
     keep_last_n: int = 5
     resume: Optional[str] = None
+    init_checkpoint: Optional[str] = None  # Load model weights only (for grown checkpoints)
+    model_config_path: Optional[str] = None  # Load model architecture from JSON
 
     # === Logging ===
     log_every: int = 10
@@ -366,17 +368,75 @@ class Trainer:
         )
         self.data_iter = iter(self.dataloader)
 
-        print("Creating Onyx 11M model...")
+        # Load model config from JSON, init_checkpoint, or use defaults
+        if config.model_config_path:
+            print(f"Loading model config from: {config.model_config_path}")
+            import json
+            with open(config.model_config_path, 'r') as f:
+                json_cfg = json.load(f)
+            arch = json_cfg.get('architecture', json_cfg)
+            mem = json_cfg.get('memory', {})
+            model_config = OnyxConfig(
+                d_model=arch.get('d_model', 384),
+                n_layers=arch.get('n_layers', 6),
+                n_heads=arch.get('n_heads', 6),
+                n_kv_heads=arch.get('n_kv_heads', 2),
+                d_ff=arch.get('d_ff', 4096),
+                vocab_size=arch.get('vocab_size', 128258),
+                max_seq_len=config.max_seq_len,  # Use training seq len
+                train_seq_len=config.max_seq_len,
+                rope_base=arch.get('rope_theta', arch.get('rope_base', 500000.0)),
+                norm_eps=arch.get('norm_eps', 1e-5),
+                use_flash_attention=(self.device_type == "cuda"),
+                gradient_checkpointing=(self.device_type == "cuda"),
+                memory_reg_weight=config.memory_reg_weight,
+            )
+        elif config.init_checkpoint:
+            print(f"Loading model config from: {config.init_checkpoint}")
+            init_ckpt = torch.load(config.init_checkpoint, map_location='cpu', weights_only=False)
+            if 'config' in init_ckpt:
+                ckpt_cfg = init_ckpt['config']
+                if isinstance(ckpt_cfg, dict):
+                    import dataclasses
+                    valid_fields = {f.name for f in dataclasses.fields(OnyxConfig)}
+                    filtered_cfg = {k: v for k, v in ckpt_cfg.items() if k in valid_fields}
+                    model_config = OnyxConfig(**filtered_cfg)
+                else:
+                    model_config = ckpt_cfg
+                # Override runtime settings
+                model_config.use_flash_attention = (self.device_type == "cuda")
+                model_config.gradient_checkpointing = (self.device_type == "cuda")
+                model_config.memory_reg_weight = config.memory_reg_weight
+                model_config.max_seq_len = config.max_seq_len
+                model_config.train_seq_len = config.max_seq_len
+            else:
+                raise ValueError("init_checkpoint has no config - use --resume for full checkpoints")
+        else:
+            print("Creating Onyx model with default config...")
+            model_config = OnyxConfig(
+                use_flash_attention=(self.device_type == "cuda"),
+                gradient_checkpointing=(self.device_type == "cuda"),
+                memory_reg_weight=config.memory_reg_weight,
+                max_seq_len=config.max_seq_len,
+                train_seq_len=config.max_seq_len,
+            )
 
-        model_config = OnyxConfig(
-            use_flash_attention=(self.device_type == "cuda"),
-            gradient_checkpointing=(self.device_type == "cuda"),
-            memory_reg_weight=config.memory_reg_weight,
-            max_seq_len=config.max_seq_len,
-            train_seq_len=config.max_seq_len,
-        )
+        print(f"Model config: d_model={model_config.d_model}, n_layers={model_config.n_layers}, "
+              f"n_heads={model_config.n_heads}")
 
         self.model = Onyx(model_config)
+
+        # Load weights from init_checkpoint if provided
+        if config.init_checkpoint:
+            print(f"Loading model weights from: {config.init_checkpoint}")
+            if 'model_state_dict' in init_ckpt:
+                self.model.load_state_dict(init_ckpt['model_state_dict'])
+            elif 'model' in init_ckpt:
+                self.model.load_state_dict(init_ckpt['model'])
+            else:
+                self.model.load_state_dict(init_ckpt)
+            print("Model weights loaded successfully")
+
         self.model = self.model.to(self.device)
 
         total_params = self.model.get_num_params()
@@ -814,10 +874,12 @@ class Trainer:
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Onyx 11M Model")
+    parser = argparse.ArgumentParser(description="Train Onyx Model")
 
     parser.add_argument("--data_glob", type=str, default=None)
     parser.add_argument("--tokenizer", type=str, default="NousResearch/Hermes-2-Pro-Llama-3-8B")
+    parser.add_argument("--model_config", type=str, default=None,
+                       help="Path to model config JSON (e.g., models/110m/config.json)")
 
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_seq_len", type=int, default=256)
@@ -837,6 +899,8 @@ def main():
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--save_every_steps", type=int, default=0)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--init_checkpoint", type=str, default=None,
+                       help="Initialize model weights from checkpoint (for grown models)")
 
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--wandb_project", type=str, default=None)
@@ -864,6 +928,8 @@ def main():
         save_dir=args.save_dir,
         save_every_steps=args.save_every_steps,
         resume=args.resume,
+        init_checkpoint=args.init_checkpoint,
+        model_config_path=args.model_config,
         log_every=args.log_every,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,

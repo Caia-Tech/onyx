@@ -20,24 +20,80 @@ except ImportError:
 from onyx_model import Onyx, OnyxConfig
 
 
-def load_model(checkpoint_path: str, device: torch.device, dtype: torch.dtype):
+def load_model(checkpoint_path: str, device: torch.device, dtype: torch.dtype, model_config_path: str = None):
     """Load model from checkpoint"""
+    import json
+    import dataclasses
+
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-    # Get config from checkpoint or use default
-    if 'config' in checkpoint:
-        cfg = checkpoint['config']
-        if isinstance(cfg, dict):
-            # Filter to only OnyxConfig fields
-            import dataclasses
-            valid_fields = {f.name for f in dataclasses.fields(OnyxConfig)}
-            filtered_cfg = {k: v for k, v in cfg.items() if k in valid_fields}
-            config = OnyxConfig(**filtered_cfg)
-        else:
-            config = cfg
-    else:
-        config = OnyxConfig()
+    # Get config - priority: explicit path > checkpoint's model_config_path > checkpoint config > default
+    config = None
 
+    # 1. Try explicit model_config_path argument
+    if model_config_path and Path(model_config_path).exists():
+        print(f"Loading model config from: {model_config_path}")
+        with open(model_config_path) as f:
+            cfg_json = json.load(f)
+        # Flatten architecture and memory sections
+        flat_cfg = {}
+        for key, value in cfg_json.items():
+            if isinstance(value, dict):
+                flat_cfg.update(value)
+            else:
+                flat_cfg[key] = value
+        valid_fields = {f.name for f in dataclasses.fields(OnyxConfig)}
+        filtered_cfg = {k: v for k, v in flat_cfg.items() if k in valid_fields}
+        config = OnyxConfig(**filtered_cfg)
+
+    # 2. Try model_config_path stored in checkpoint's training config
+    elif 'config' in checkpoint:
+        cfg = checkpoint['config']
+        if isinstance(cfg, dict) and 'model_config_path' in cfg:
+            # Checkpoint has a reference to model config JSON file
+            mcp = cfg['model_config_path']
+            # Try relative to checkpoint directory first, then as-is
+            ckpt_dir = Path(checkpoint_path).parent
+            possible_paths = [
+                ckpt_dir / mcp,
+                ckpt_dir.parent / mcp,
+                Path(mcp),
+            ]
+            for p in possible_paths:
+                if p.exists():
+                    print(f"Loading model config from checkpoint reference: {p}")
+                    with open(p) as f:
+                        cfg_json = json.load(f)
+                    flat_cfg = {}
+                    for key, value in cfg_json.items():
+                        if isinstance(value, dict):
+                            flat_cfg.update(value)
+                        else:
+                            flat_cfg[key] = value
+                    valid_fields = {f.name for f in dataclasses.fields(OnyxConfig)}
+                    filtered_cfg = {k: v for k, v in flat_cfg.items() if k in valid_fields}
+                    config = OnyxConfig(**filtered_cfg)
+                    break
+
+    # 3. Fall back to checkpoint config dict or default
+    if config is None:
+        if 'config' in checkpoint:
+            cfg = checkpoint['config']
+            if isinstance(cfg, dict):
+                valid_fields = {f.name for f in dataclasses.fields(OnyxConfig)}
+                filtered_cfg = {k: v for k, v in cfg.items() if k in valid_fields}
+                if filtered_cfg:
+                    config = OnyxConfig(**filtered_cfg)
+                else:
+                    print("Warning: No valid model config found, using default 80M config")
+                    config = OnyxConfig()
+            else:
+                config = cfg
+        else:
+            print("Warning: No config in checkpoint, using default 80M config")
+            config = OnyxConfig()
+
+    print(f"Model config: d_model={config.d_model}, n_layers={config.n_layers}, n_heads={config.n_heads}")
     model = Onyx(config)
 
     # Load state dict
@@ -155,6 +211,8 @@ def main():
 
     # Model
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
+    parser.add_argument("--model_config", type=str, default=None,
+                       help="Path to model config JSON (auto-detected from checkpoint if not provided)")
     parser.add_argument("--tokenizer", type=str, default="NousResearch/Hermes-2-Pro-Llama-3-8B")
 
     # Memory
@@ -214,7 +272,7 @@ def main():
 
     # Load model
     print(f"Loading checkpoint: {args.checkpoint}")
-    model, config = load_model(args.checkpoint, device, dtype)
+    model, config = load_model(args.checkpoint, device, dtype, args.model_config)
     print(f"Model parameters: {model.get_num_params():,}")
 
     # Single prompt or chat
