@@ -506,7 +506,9 @@ class HopeAttention(nn.Module):
         inference_mode: bool = False,
         cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
-    ) -> Tuple[Tensor, Dict[str, Tensor]]:
+        kv_cache: Optional[Dict[str, Tensor]] = None,
+        position_offset: int = 0,
+    ) -> Tuple[Tensor, Dict[str, Tensor], Optional[Dict[str, Tensor]]]:
         B, S, _ = x.shape
 
         if self.conv is not None:
@@ -541,7 +543,10 @@ class HopeAttention(nn.Module):
         else:
             v = self.v_proj(x).view(B, S, self.n_kv_heads, self.head_dim)
 
-        cos, sin = self.rotary(q, S)
+        # Apply RoPE with position offset for KV cache
+        total_seq_len = position_offset + S
+        cos, sin = self.rotary(q, total_seq_len)
+
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
@@ -549,27 +554,43 @@ class HopeAttention(nn.Module):
         q_rope = q.view(B * self.n_heads, S, self.head_dim)
         k_rope = k.view(B * self.n_kv_heads, S, self.head_dim)
 
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
+        # Use position offset for RoPE
+        cos = cos[position_offset:position_offset + S].unsqueeze(0)
+        sin = sin[position_offset:position_offset + S].unsqueeze(0)
         q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos, sin)
 
         q = q_rope.view(B, self.n_heads, S, self.head_dim)
         k = k_rope.view(B, self.n_kv_heads, S, self.head_dim)
 
-        if self.n_rep > 1:
-            k = k.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_heads, S, self.head_dim)
-            v = v.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_heads, S, self.head_dim)
+        # KV cache handling
+        new_kv_cache = None
+        if kv_cache is not None or inference_mode:
+            # Concat with cache if exists
+            if kv_cache is not None and 'k' in kv_cache:
+                k = torch.cat([kv_cache['k'], k], dim=2)
+                v = torch.cat([kv_cache['v'], v], dim=2)
+            # Store new cache
+            new_kv_cache = {'k': k, 'v': v}
 
-        if self.config.use_flash_attention and FLASH_ATTN_AVAILABLE:
-            # Use varlen if cu_seqlens provided (packed sequences with different docs)
+        # Get sequence length after potential cache concat
+        kv_seq_len = k.shape[2]
+
+        if self.n_rep > 1:
+            k_expanded = k.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_heads, kv_seq_len, self.head_dim)
+            v_expanded = v.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_heads, kv_seq_len, self.head_dim)
+        else:
+            k_expanded = k
+            v_expanded = v
+
+        if self.config.use_flash_attention and FLASH_ATTN_AVAILABLE and kv_cache is None:
+            # Flash attention only for non-cached path (full sequence)
             if cu_seqlens is not None and max_seqlen is not None:
-                # Reshape for varlen: (batch * seq, heads, head_dim)
-                q = q.transpose(1, 2).reshape(B * S, self.n_heads, self.head_dim)
-                k = k.transpose(1, 2).reshape(B * S, self.n_heads, self.head_dim)
-                v = v.transpose(1, 2).reshape(B * S, self.n_heads, self.head_dim)
+                q_fa = q.transpose(1, 2).reshape(B * S, self.n_heads, self.head_dim)
+                k_fa = k_expanded.transpose(1, 2).reshape(B * kv_seq_len, self.n_heads, self.head_dim)
+                v_fa = v_expanded.transpose(1, 2).reshape(B * kv_seq_len, self.n_heads, self.head_dim)
 
                 attn_out = flash_attn_varlen_func(
-                    q, k, v,
+                    q_fa, k_fa, v_fa,
                     cu_seqlens_q=cu_seqlens,
                     cu_seqlens_k=cu_seqlens,
                     max_seqlen_q=max_seqlen,
@@ -578,23 +599,33 @@ class HopeAttention(nn.Module):
                 )
                 attn_out = attn_out.reshape(B, S, -1)
             else:
-                q = q.transpose(1, 2)
-                k = k.transpose(1, 2)
-                v = v.transpose(1, 2)
-                attn_out = flash_attn_func(q, k, v, causal=True)
+                q_fa = q.transpose(1, 2)
+                k_fa = k_expanded.transpose(1, 2)
+                v_fa = v_expanded.transpose(1, 2)
+                attn_out = flash_attn_func(q_fa, k_fa, v_fa, causal=True)
                 attn_out = attn_out.reshape(B, S, -1)
         else:
+            # Standard attention (supports KV cache)
             scale = 1.0 / math.sqrt(self.head_dim)
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            mask = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), diagonal=1)
-            attn = attn.masked_fill(mask, float('-inf'))
+            attn = torch.matmul(q, k_expanded.transpose(-2, -1)) * scale
+
+            # Causal mask - only mask future tokens relative to query position
+            if kv_cache is not None:
+                # For cached inference: query attends to all cached + current
+                # No masking needed for single token generation
+                pass
+            else:
+                # Full sequence: standard causal mask
+                mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                attn = attn.masked_fill(mask, float('-inf'))
+
             attn = F.softmax(attn, dim=-1)
             attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
-            attn_out = torch.matmul(attn, v)
+            attn_out = torch.matmul(attn, v_expanded)
             attn_out = attn_out.transpose(1, 2).reshape(B, S, -1)
 
         output = self.o_proj(attn_out)
-        return output, new_memory_states
+        return output, new_memory_states, new_kv_cache
 
 
 class StandardAttention(nn.Module):
@@ -710,23 +741,29 @@ class HopeBlock(nn.Module):
         inference_mode: bool = False,
         cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
-    ) -> Tuple[Tensor, Dict[str, Any]]:
+        kv_cache: Optional[Dict[str, Tensor]] = None,
+        position_offset: int = 0,
+    ) -> Tuple[Tensor, Dict[str, Any], Optional[Dict[str, Tensor]]]:
         attn_mem = memory_states.get('attention', {}) if memory_states else {}
+        layer_kv_cache = kv_cache.get('kv', None) if kv_cache else None
 
-        attn_out, new_attn_mem = self.attention(
+        attn_out, new_attn_mem, new_kv = self.attention(
             self.norm1(x),
             memory_states=attn_mem,
             update_memories=update_memories,
             inference_mode=inference_mode,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            kv_cache=layer_kv_cache,
+            position_offset=position_offset,
         )
         x = x + attn_out
 
         x = x + self.ffn(self.norm2(x))
 
         new_states = {'attention': new_attn_mem} if new_attn_mem else {}
-        return x, new_states
+        new_cache = {'kv': new_kv} if new_kv else None
+        return x, new_states, new_cache
 
 
 # =============================================================================
@@ -846,6 +883,8 @@ class Onyx(nn.Module):
         return_memory_reg_loss: bool = False,
         cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
+        kv_cache: Optional[List[Dict[str, Tensor]]] = None,
+        position_offset: int = 0,
     ) -> Dict[str, Any]:
         B, S = input_ids.shape
 
@@ -855,18 +894,23 @@ class Onyx(nn.Module):
         if memory_states is None:
             memory_states = [None] * len(self.layers)
 
+        if kv_cache is None:
+            kv_cache = [None] * len(self.layers)
+
         new_memory_states = []
+        new_kv_cache = []
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
-                x, new_mem = torch.utils.checkpoint.checkpoint(
+                x, new_mem, new_kv = torch.utils.checkpoint.checkpoint(
                     layer, x, memory_states[i], update_memories, inference_mode,
-                    cu_seqlens, max_seqlen,
+                    cu_seqlens, max_seqlen, kv_cache[i], position_offset,
                     use_reentrant=False
                 )
             else:
-                x, new_mem = layer(x, memory_states[i], update_memories, inference_mode,
-                                   cu_seqlens, max_seqlen)
+                x, new_mem, new_kv = layer(x, memory_states[i], update_memories, inference_mode,
+                                           cu_seqlens, max_seqlen, kv_cache[i], position_offset)
             new_memory_states.append(new_mem)
+            new_kv_cache.append(new_kv)
 
         if update_memories:
             self._memory_update_count += S
@@ -888,6 +932,7 @@ class Onyx(nn.Module):
             "logits": logits,
             "loss": loss,
             "memory_states": new_memory_states,
+            "kv_cache": new_kv_cache,
         }
 
         if return_memory_reg_loss:
@@ -908,6 +953,7 @@ class Onyx(nn.Module):
         memory_path: Optional[str] = None,
         update_memory: bool = True,
         eos_token_id: Optional[int] = None,
+        use_kv_cache: bool = True,
     ) -> Tuple[Tensor, List[Dict[str, Any]]]:
         self.eval()
         B, S = input_ids.shape
@@ -926,13 +972,17 @@ class Onyx(nn.Module):
             elif memory_states is None:
                 memory_states = self.init_memory_states(B, device, dtype)
 
+        # Process prompt
         outputs = self(
             input_ids,
             memory_states=memory_states,
             update_memories=update_memory,
             inference_mode=True,
+            position_offset=0,
         )
         memory_states = outputs["memory_states"]
+        kv_cache = outputs["kv_cache"] if use_kv_cache else None
+        position_offset = S
 
         generated = input_ids.clone()
 
@@ -967,8 +1017,12 @@ class Onyx(nn.Module):
                 memory_states=memory_states,
                 update_memories=update_memory,
                 inference_mode=True,
+                kv_cache=kv_cache,
+                position_offset=position_offset,
             )
             memory_states = outputs["memory_states"]
+            kv_cache = outputs["kv_cache"] if use_kv_cache else None
+            position_offset += 1
 
         if memory_mode == "persistent" and memory_path and update_memory:
             self.save_memory_states(memory_states, memory_path)

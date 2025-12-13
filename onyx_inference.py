@@ -3,13 +3,18 @@ Onyx Inference Script
 
 Usage:
   python onyx_inference.py --checkpoint path/to/checkpoint.pt
-  python onyx_inference.py --checkpoint path/to/checkpoint.pt --learning  # enables memory updates
-  python onyx_inference.py --checkpoint path/to/checkpoint.pt --memory persistent --memory_path memory.pt
+  python onyx_inference.py --checkpoint path/to/checkpoint.pt --learning
+  python onyx_inference.py --checkpoint path/to/checkpoint.pt --stream
+  python onyx_inference.py --checkpoint path/to/checkpoint.pt --prompt "Hello"
 """
 
 import argparse
+import sys
+import time
 import torch
+import torch.nn.functional as F
 from pathlib import Path
+from typing import Optional, List, Dict, Any, Generator, Tuple
 
 try:
     from transformers import AutoTokenizer
@@ -27,15 +32,12 @@ def load_model(checkpoint_path: str, device: torch.device, dtype: torch.dtype, m
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-    # Get config - priority: explicit path > checkpoint's model_config_path > checkpoint config > default
     config = None
 
-    # 1. Try explicit model_config_path argument
     if model_config_path and Path(model_config_path).exists():
         print(f"Loading model config from: {model_config_path}")
         with open(model_config_path) as f:
             cfg_json = json.load(f)
-        # Flatten architecture and memory sections
         flat_cfg = {}
         for key, value in cfg_json.items():
             if isinstance(value, dict):
@@ -46,13 +48,10 @@ def load_model(checkpoint_path: str, device: torch.device, dtype: torch.dtype, m
         filtered_cfg = {k: v for k, v in flat_cfg.items() if k in valid_fields}
         config = OnyxConfig(**filtered_cfg)
 
-    # 2. Try model_config_path stored in checkpoint's training config
     elif 'config' in checkpoint:
         cfg = checkpoint['config']
         if isinstance(cfg, dict) and 'model_config_path' in cfg:
-            # Checkpoint has a reference to model config JSON file
             mcp = cfg['model_config_path']
-            # Try relative to checkpoint directory first, then as-is
             ckpt_dir = Path(checkpoint_path).parent
             possible_paths = [
                 ckpt_dir / mcp,
@@ -75,7 +74,6 @@ def load_model(checkpoint_path: str, device: torch.device, dtype: torch.dtype, m
                     config = OnyxConfig(**filtered_cfg)
                     break
 
-    # 3. Fall back to checkpoint config dict or default
     if config is None:
         if 'config' in checkpoint:
             cfg = checkpoint['config']
@@ -85,30 +83,157 @@ def load_model(checkpoint_path: str, device: torch.device, dtype: torch.dtype, m
                 if filtered_cfg:
                     config = OnyxConfig(**filtered_cfg)
                 else:
-                    print("Warning: No valid model config found, using default 80M config")
+                    print("Warning: No valid model config found, using default config")
                     config = OnyxConfig()
             else:
                 config = cfg
         else:
-            print("Warning: No config in checkpoint, using default 80M config")
+            print("Warning: No config in checkpoint, using default config")
             config = OnyxConfig()
 
     print(f"Model config: d_model={config.d_model}, n_layers={config.n_layers}, n_heads={config.n_heads}")
     model = Onyx(config)
 
-    # Load state dict
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     elif 'model' in checkpoint:
         model.load_state_dict(checkpoint['model'])
     else:
-        # Try loading directly
         model.load_state_dict(checkpoint)
 
     model = model.to(device=device, dtype=dtype)
     model.eval()
 
     return model, config
+
+
+def sample_token(
+    logits: torch.Tensor,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    top_p: float = 0.9,
+    min_p: float = 0.0,
+    repetition_penalty: float = 1.0,
+    generated_tokens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Sample next token with various strategies"""
+
+    # Repetition penalty
+    if repetition_penalty != 1.0 and generated_tokens is not None and generated_tokens.numel() > 0:
+        for token_id in generated_tokens.unique():
+            if logits[0, token_id] > 0:
+                logits[0, token_id] /= repetition_penalty
+            else:
+                logits[0, token_id] *= repetition_penalty
+
+    if temperature <= 0:
+        return logits.argmax(dim=-1, keepdim=True)
+
+    logits = logits / temperature
+
+    # Top-k
+    if top_k > 0:
+        top_k = min(top_k, logits.size(-1))
+        v, _ = torch.topk(logits, top_k)
+        logits[logits < v[:, [-1]]] = float('-inf')
+
+    # Min-p (dynamic threshold based on top token probability)
+    if min_p > 0:
+        probs = F.softmax(logits, dim=-1)
+        top_prob = probs.max(dim=-1, keepdim=True).values
+        min_prob_threshold = top_prob * min_p
+        logits[probs < min_prob_threshold] = float('-inf')
+
+    # Top-p (nucleus)
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+        sorted_indices_to_remove[:, 0] = 0
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = float('-inf')
+
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
+def generate_stream(
+    model: Onyx,
+    input_ids: torch.Tensor,
+    max_new_tokens: int = 512,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    top_p: float = 0.9,
+    min_p: float = 0.0,
+    repetition_penalty: float = 1.1,
+    memory_states: Optional[List[Dict[str, Any]]] = None,
+    memory_mode: str = "session",
+    update_memory: bool = True,
+    eos_token_id: Optional[int] = None,
+    stop_tokens: Optional[List[int]] = None,
+    use_kv_cache: bool = True,
+) -> Generator[Tuple[torch.Tensor, List[Dict[str, Any]]], None, None]:
+    """Generate tokens one at a time, yielding each token"""
+
+    model.eval()
+    B, S = input_ids.shape
+    device = input_ids.device
+    dtype = next(model.parameters()).dtype
+
+    if memory_states is None:
+        memory_states = model.init_memory_states(B, device, dtype)
+
+    # Process prompt
+    with torch.no_grad():
+        outputs = model(
+            input_ids,
+            memory_states=memory_states,
+            update_memories=update_memory,
+            inference_mode=True,
+            position_offset=0,
+        )
+        memory_states = outputs["memory_states"]
+        kv_cache = outputs.get("kv_cache") if use_kv_cache else None
+        position_offset = S
+
+    generated_tokens = torch.tensor([], dtype=torch.long, device=device)
+    stop_tokens = stop_tokens or []
+    if eos_token_id is not None:
+        stop_tokens.append(eos_token_id)
+
+    for _ in range(max_new_tokens):
+        with torch.no_grad():
+            logits = outputs["logits"][:, -1:, :]
+
+            next_token = sample_token(
+                logits.squeeze(1),
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                generated_tokens=generated_tokens,
+            )
+
+            generated_tokens = torch.cat([generated_tokens, next_token.squeeze(0)])
+
+            yield next_token, memory_states
+
+            if next_token.item() in stop_tokens:
+                break
+
+            outputs = model(
+                next_token,
+                memory_states=memory_states,
+                update_memories=update_memory,
+                inference_mode=True,
+                kv_cache=kv_cache,
+                position_offset=position_offset,
+            )
+            memory_states = outputs["memory_states"]
+            kv_cache = outputs.get("kv_cache") if use_kv_cache else None
+            position_offset += 1
 
 
 def chat(
@@ -122,84 +247,168 @@ def chat(
     temperature: float = 0.8,
     top_k: int = 50,
     top_p: float = 0.9,
+    min_p: float = 0.0,
+    repetition_penalty: float = 1.1,
     max_tokens: int = 512,
+    stream: bool = True,
+    system_prompt: str = None,
 ):
-    """Interactive chat loop"""
+    """Interactive chat loop with streaming"""
+
     print("\n" + "="*60)
-    print("Onyx Chat")
+    print("  Onyx Chat")
     print("="*60)
-    print(f"Memory mode: {memory_mode}")
-    print(f"Learning: {'ON' if learning else 'OFF'}")
-    if memory_path:
-        print(f"Memory path: {memory_path}")
-    print("Type 'quit' or 'exit' to end, 'clear' to reset memory")
+    print(f"  Memory: {memory_mode} | Learning: {'ON' if learning else 'OFF'} | Stream: {'ON' if stream else 'OFF'}")
+    print("-"*60)
+    print("  Commands:")
+    print("    /quit, /exit    - End session")
+    print("    /clear          - Reset memory")
+    print("    /save           - Save memory (if persistent)")
+    print("    /learning on|off- Toggle learning mode")
+    print("    /temp <value>   - Set temperature")
+    print("    /system <text>  - Set system prompt")
     print("="*60 + "\n")
 
     memory_states = None
+    conversation_history = []
 
-    # Load persistent memory if exists
     if memory_mode == "persistent" and memory_path and Path(memory_path).exists():
         memory_states = model.load_memory_states(memory_path, device, dtype)
-        print(f"Loaded memory from {memory_path}")
+        print(f"[Loaded memory from {memory_path}]\n")
+
+    # Get special tokens
+    eos_token_id = tokenizer.eos_token_id
+    stop_tokens = [eos_token_id] if eos_token_id else []
+
+    # Add common stop tokens
+    for token in ["<|eot_id|>", "<|end|>", "</s>", "<|im_end|>"]:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id != tokenizer.unk_token_id:
+            stop_tokens.append(token_id)
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            user_input = input("\033[92mYou:\033[0m ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
+            print("\n\nGoodbye!")
             break
 
         if not user_input:
             continue
 
-        if user_input.lower() in ['quit', 'exit']:
-            break
+        # Handle commands
+        if user_input.startswith('/'):
+            cmd_parts = user_input[1:].split(maxsplit=1)
+            cmd = cmd_parts[0].lower()
+            cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else None
 
-        if user_input.lower() == 'clear':
-            memory_states = None
-            print("Memory cleared.\n")
-            continue
-
-        if user_input.lower() == 'save' and memory_path:
-            if memory_states:
-                model.save_memory_states(memory_states, memory_path)
-                print(f"Memory saved to {memory_path}\n")
+            if cmd in ['quit', 'exit', 'q']:
+                print("Goodbye!")
+                break
+            elif cmd == 'clear':
+                memory_states = None
+                conversation_history = []
+                print("[Memory cleared]\n")
+                continue
+            elif cmd == 'save' and memory_path:
+                if memory_states:
+                    model.save_memory_states(memory_states, memory_path)
+                    print(f"[Memory saved to {memory_path}]\n")
+                else:
+                    print("[No memory to save]\n")
+                continue
+            elif cmd == 'learning' and cmd_arg:
+                if cmd_arg.lower() in ['on', 'true', '1']:
+                    learning = True
+                    print("[Learning: ON]\n")
+                elif cmd_arg.lower() in ['off', 'false', '0']:
+                    learning = False
+                    print("[Learning: OFF]\n")
+                continue
+            elif cmd == 'temp' and cmd_arg:
+                try:
+                    temperature = float(cmd_arg)
+                    print(f"[Temperature: {temperature}]\n")
+                except ValueError:
+                    print("[Invalid temperature value]\n")
+                continue
+            elif cmd == 'system' and cmd_arg:
+                system_prompt = cmd_arg
+                print(f"[System prompt set]\n")
+                continue
             else:
-                print("No memory to save.\n")
-            continue
+                print(f"[Unknown command: {cmd}]\n")
+                continue
 
-        if user_input.lower().startswith('learning '):
-            val = user_input.split()[1].lower()
-            if val in ['on', 'true', '1']:
-                learning = True
-                print("Learning: ON\n")
-            elif val in ['off', 'false', '0']:
-                learning = False
-                print("Learning: OFF\n")
-            continue
+        # Build prompt
+        prompt = ""
+        if system_prompt:
+            prompt += f"System: {system_prompt}\n\n"
 
-        # Tokenize input
-        input_ids = tokenizer.encode(user_input, return_tensors='pt').to(device)
+        # Add conversation history (last few turns)
+        for turn in conversation_history[-4:]:
+            prompt += f"User: {turn['user']}\nAssistant: {turn['assistant']}\n\n"
 
-        # Generate
+        prompt += f"User: {user_input}\nAssistant:"
+
+        input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+
         update_memory = learning or (memory_mode != "stateless")
 
-        output_ids, memory_states = model.generate(
-            input_ids,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            memory_states=memory_states,
-            memory_mode=memory_mode if not learning else "session",
-            memory_path=memory_path if memory_mode == "persistent" and not learning else None,
-            update_memory=update_memory,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        print("\033[94mOnyx:\033[0m ", end="", flush=True)
 
-        # Decode response (skip input tokens)
-        response = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
-        print(f"Onyx: {response}\n")
+        start_time = time.time()
+        generated_text = ""
+        token_count = 0
+
+        if stream:
+            for token, memory_states in generate_stream(
+                model,
+                input_ids,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                memory_states=memory_states,
+                memory_mode=memory_mode,
+                update_memory=update_memory,
+                eos_token_id=eos_token_id,
+                stop_tokens=stop_tokens,
+            ):
+                token_text = tokenizer.decode(token[0], skip_special_tokens=True)
+                print(token_text, end="", flush=True)
+                generated_text += token_text
+                token_count += 1
+        else:
+            # Non-streaming fallback
+            output_ids, memory_states = model.generate(
+                input_ids,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                memory_states=memory_states,
+                memory_mode=memory_mode if not learning else "session",
+                memory_path=memory_path if memory_mode == "persistent" and not learning else None,
+                update_memory=update_memory,
+                eos_token_id=eos_token_id,
+            )
+            generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
+            token_count = output_ids.shape[1] - input_ids.shape[1]
+            print(generated_text, end="")
+
+        elapsed = time.time() - start_time
+        tok_per_sec = token_count / elapsed if elapsed > 0 else 0
+
+        print(f"\n\033[90m[{token_count} tokens, {tok_per_sec:.1f} tok/s]\033[0m\n")
+
+        # Save to history
+        conversation_history.append({
+            'user': user_input,
+            'assistant': generated_text.strip()
+        })
 
         # Save memory if persistent and learning
         if memory_mode == "persistent" and memory_path and learning:
@@ -212,35 +421,46 @@ def main():
     # Model
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
     parser.add_argument("--model_config", type=str, default=None,
-                       help="Path to model config JSON (auto-detected from checkpoint if not provided)")
+                       help="Path to model config JSON")
     parser.add_argument("--tokenizer", type=str, default="NousResearch/Hermes-2-Pro-Llama-3-8B")
 
     # Memory
     parser.add_argument("--memory", type=str, default="session",
-                       choices=["stateless", "session", "persistent"],
-                       help="Memory mode")
-    parser.add_argument("--memory_path", type=str, default=None,
-                       help="Path for persistent memory")
+                       choices=["stateless", "session", "persistent"])
+    parser.add_argument("--memory_path", type=str, default=None)
     parser.add_argument("--learning", action="store_true",
-                       help="Enable learning mode (updates memory during inference)")
+                       help="Enable learning mode")
 
     # Generation
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--min_p", type=float, default=0.0,
+                       help="Min-p sampling threshold")
+    parser.add_argument("--repetition_penalty", type=float, default=1.1)
     parser.add_argument("--max_tokens", type=int, default=512)
 
+    # Output
+    parser.add_argument("--stream", action="store_true", default=True,
+                       help="Stream output tokens")
+    parser.add_argument("--no_stream", action="store_true",
+                       help="Disable streaming")
+
     # Device
-    parser.add_argument("--device", type=str, default=None,
-                       help="Device (cuda/mps/cpu)")
+    parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="float32",
                        choices=["float32", "float16", "bfloat16"])
 
     # Single prompt mode
     parser.add_argument("--prompt", type=str, default=None,
-                       help="Single prompt (non-interactive mode)")
+                       help="Single prompt (non-interactive)")
+    parser.add_argument("--system", type=str, default=None,
+                       help="System prompt")
 
     args = parser.parse_args()
+
+    # Handle stream flag
+    stream = args.stream and not args.no_stream
 
     # Setup device
     if args.device:
@@ -252,7 +472,6 @@ def main():
     else:
         device = torch.device("cpu")
 
-    # Setup dtype
     dtype_map = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -260,37 +479,54 @@ def main():
     }
     dtype = dtype_map[args.dtype]
 
-    print(f"Device: {device}")
-    print(f"Dtype: {dtype}")
+    print(f"Device: {device} | Dtype: {dtype}")
 
-    # Load tokenizer
     if not TRANSFORMERS_AVAILABLE:
         raise RuntimeError("transformers not installed. Run: pip install transformers")
 
     print(f"Loading tokenizer: {args.tokenizer}")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
 
-    # Load model
     print(f"Loading checkpoint: {args.checkpoint}")
     model, config = load_model(args.checkpoint, device, dtype, args.model_config)
     print(f"Model parameters: {model.get_num_params():,}")
 
-    # Single prompt or chat
     if args.prompt:
-        input_ids = tokenizer.encode(args.prompt, return_tensors='pt').to(device)
-        output_ids, _ = model.generate(
-            input_ids,
-            max_new_tokens=args.max_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            memory_mode=args.memory,
-            memory_path=args.memory_path,
-            update_memory=args.learning,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-        response = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        print(response)
+        # Single prompt mode with streaming
+        prompt = args.prompt
+        if args.system:
+            prompt = f"System: {args.system}\n\nUser: {prompt}\nAssistant:"
+
+        input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+
+        if stream:
+            for token, _ in generate_stream(
+                model,
+                input_ids,
+                max_new_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                min_p=args.min_p,
+                repetition_penalty=args.repetition_penalty,
+                memory_mode=args.memory,
+                update_memory=args.learning,
+                eos_token_id=tokenizer.eos_token_id,
+            ):
+                print(tokenizer.decode(token[0], skip_special_tokens=True), end="", flush=True)
+            print()
+        else:
+            output_ids, _ = model.generate(
+                input_ids,
+                max_new_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                memory_mode=args.memory,
+                update_memory=args.learning,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
     else:
         chat(
             model=model,
@@ -303,7 +539,11 @@ def main():
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
+            min_p=args.min_p,
+            repetition_penalty=args.repetition_penalty,
             max_tokens=args.max_tokens,
+            stream=stream,
+            system_prompt=args.system,
         )
 
 
