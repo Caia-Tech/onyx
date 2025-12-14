@@ -26,7 +26,7 @@ from onyx_model import Onyx, OnyxConfig
 
 
 def load_model(checkpoint_path: str, device: torch.device, dtype: torch.dtype, model_config_path: str = None):
-    """Load model from checkpoint"""
+    """Load model from checkpoint with auto-vocab resizing"""
     import json
     import dataclasses
 
@@ -94,13 +94,38 @@ def load_model(checkpoint_path: str, device: torch.device, dtype: torch.dtype, m
     print(f"Model config: d_model={config.d_model}, n_layers={config.n_layers}, n_heads={config.n_heads}")
     model = Onyx(config)
 
+    # Determine state dict
+    state_dict = None
     if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
     elif 'model' in checkpoint:
-        model.load_state_dict(checkpoint['model'])
+        state_dict = checkpoint['model']
     else:
-        model.load_state_dict(checkpoint)
+        state_dict = checkpoint
 
+    # [FIX] Handle Vocab Mismatch (e.g., 128256 vs 128258)
+    if 'embed.weight' in state_dict:
+        ckpt_vocab = state_dict['embed.weight'].shape[0]
+        model_vocab = config.vocab_size
+        
+        if ckpt_vocab != model_vocab:
+            print(f"Warning: Checkpoint vocab ({ckpt_vocab}) != Config ({model_vocab}). Auto-resizing...")
+            
+            for key in ['embed.weight', 'lm_head.weight']:
+                if key in state_dict:
+                    w = state_dict[key]
+                    if w.shape[0] < model_vocab:
+                        # Pad with zeros
+                        print(f"  - Padding {key}: {w.shape} -> ({model_vocab}, {w.shape[1]})")
+                        pad_size = model_vocab - w.shape[0]
+                        pad = torch.zeros((pad_size, w.shape[1]), dtype=w.dtype, device=w.device)
+                        state_dict[key] = torch.cat([w, pad], dim=0)
+                    elif w.shape[0] > model_vocab:
+                        # Truncate
+                        print(f"  - Truncating {key}: {w.shape} -> ({model_vocab}, {w.shape[1]})")
+                        state_dict[key] = w[:model_vocab, :]
+
+    model.load_state_dict(state_dict, strict=True)
     model = model.to(device=device, dtype=dtype)
     model.eval()
 
@@ -126,8 +151,9 @@ def sample_token(
             else:
                 logits[0, token_id] *= repetition_penalty
 
+    # Deterministic generation for temp=0
     if temperature <= 0:
-        return logits.argmax(dim=-1, keepdim=True)
+        return torch.argmax(logits, dim=-1, keepdim=True)
 
     logits = logits / temperature
 
@@ -280,11 +306,14 @@ def chat(
     eos_token_id = tokenizer.eos_token_id
     stop_tokens = [eos_token_id] if eos_token_id else []
 
-    # Add common stop tokens
-    for token in ["<|eot_id|>", "<|end|>", "</s>", "<|im_end|>"]:
+    # Explicit Llama-3 Stop Tokens
+    llama3_stops = ["<|eot_id|>", "<|end_of_text|>", "<|im_end|>", "<|end|>", "</s>"]
+    for token in llama3_stops:
         token_id = tokenizer.convert_tokens_to_ids(token)
-        if token_id != tokenizer.unk_token_id:
+        if token_id != tokenizer.unk_token_id and token_id not in stop_tokens:
             stop_tokens.append(token_id)
+            
+    print(f"[Debug] Stop Tokens: {stop_tokens}")
 
     while True:
         try:
@@ -498,6 +527,15 @@ def main():
             prompt = f"System: {args.system}\n\nUser: {prompt}\nAssistant:"
 
         input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+        
+        # Stop tokens for single prompt
+        eos_token_id = tokenizer.eos_token_id
+        stop_tokens = [eos_token_id] if eos_token_id else []
+        llama3_stops = ["<|eot_id|>", "<|end_of_text|>", "<|im_end|>", "</s>"]
+        for token in llama3_stops:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id != tokenizer.unk_token_id and token_id not in stop_tokens:
+                stop_tokens.append(token_id)
 
         if stream:
             for token, _ in generate_stream(
@@ -511,7 +549,8 @@ def main():
                 repetition_penalty=args.repetition_penalty,
                 memory_mode=args.memory,
                 update_memory=args.learning,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=eos_token_id,
+                stop_tokens=stop_tokens
             ):
                 print(tokenizer.decode(token[0], skip_special_tokens=True), end="", flush=True)
             print()
@@ -524,7 +563,7 @@ def main():
                 top_p=args.top_p,
                 memory_mode=args.memory,
                 update_memory=args.learning,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=eos_token_id,
             )
             print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
     else:

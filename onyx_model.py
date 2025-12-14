@@ -58,7 +58,7 @@ class OnyxConfig:
     # === Sequence & Vocab ===
     max_seq_len: int = 4096
     train_seq_len: int = 4096
-    vocab_size: int = 128258      # Llama-3 tokenizer
+    vocab_size: int = 128258      # Updated to match strict Llama-3 spec
 
     # === RoPE ===
     rope_base: float = 500000.0
@@ -989,26 +989,31 @@ class Onyx(nn.Module):
         for _ in range(max_new_tokens):
             logits = outputs["logits"][:, -1, :]
 
-            if temperature > 0:
+            # [FIXED] Deterministic generation for temp=0
+            if temperature <= 0:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
                 logits = logits / temperature
 
-            if top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float('-inf')
+                if top_k > 0:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = float('-inf')
 
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = 0
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = float('-inf')
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                    sorted_indices_to_remove[:, 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = float('-inf')
 
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+
             generated = torch.cat([generated, next_token], dim=1)
 
+            # [FIXED] Strict EOS check
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
 

@@ -1,6 +1,6 @@
 {
     "name": "onyx-150m",
-    "version": "1.0",
+    "version": "1.1",
 
     "architecture": {
         "d_model": 512,
@@ -8,7 +8,7 @@
         "n_heads": 8,
         "n_kv_heads": 2,
         "d_ff": 4096,
-        "vocab_size": 128256,
+        "vocab_size": 128258,
         "max_seq_len": 8192,
         "rope_theta": 500000.0,
         "norm_eps": 1e-5
@@ -28,5 +28,5 @@
 
     "growth_from": "110m",
     "growth_strategy": "nested",
-    "notes": "Grown from 110m. d_model +64, n_layers +1."
+    "notes": "Updated vocab_size to 128258 per Todo Item A."
 }

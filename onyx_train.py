@@ -12,6 +12,7 @@ Features:
 - Memory statistics logging to WandB
 - Streaming packed dataset
 - Signal handler for graceful interrupt/save
+- [NEW] Startup sanity checks for tokenizer & vocab
 
 Usage:
   # Mac training
@@ -309,6 +310,49 @@ class Trainer:
         print(f"\n[SIGNAL] Received {signum}, will save and exit after current step...")
         self._interrupt_requested = True
 
+    def _run_sanity_checks(self):
+        """
+        Todo Item A & G: Tokenizer & Decoding Sanity Checks
+        """
+        print(f"\n{'='*30}")
+        print("RUNNING SANITY CHECKS (TODO A & G)")
+        print(f"{'='*30}")
+
+        # 1. Verify Vocab Size (Todo A)
+        if self.tokenizer:
+            vocab_size = len(self.tokenizer)
+            print(f"[*] Tokenizer vocab size: {vocab_size}")
+            
+            # Note: Standard Llama-3 is 128256. Some versions use 128258. 
+            if vocab_size != self.model.config.vocab_size:
+                 print(f"[!] WARNING: Tokenizer size ({vocab_size}) != Model Config ({self.model.config.vocab_size})")
+            else:
+                 print(f"[*] Vocab size matches model config: {vocab_size}")
+        
+        # 2. Round-trip test (Todo G)
+        test_prompts = ["hello", "2", " The quick brown fox"]
+        print("[*] Running round-trip tokenization tests...")
+        for text in test_prompts:
+            tokens = self.tokenizer.encode(text, add_special_tokens=False)
+            decoded = self.tokenizer.decode(tokens)
+            # Loose check for content overlap (ignoring some whitespace variations)
+            if text.strip() not in decoded.strip(): 
+                print(f"[!] Round-trip FAILED for '{text}': Got '{decoded}'")
+            else:
+                print(f"    - '{text}' -> {tokens} -> '{decoded}' [PASS]")
+
+        # 3. Check Special Tokens (Todo D)
+        specials = ["<|begin_of_text|>", "<|end_of_text|>", "<|eot_id|>"]
+        print("[*] Verifying Llama-3 special tokens...")
+        for t in specials:
+            tid = self.tokenizer.convert_tokens_to_ids(t)
+            if tid == self.tokenizer.unk_token_id:
+                 print(f"[!] WARNING: Special token {t} mapped to UNK!")
+            else:
+                 print(f"    - {t}: {tid} [OK]")
+
+        print(f"{'='*30}\n")
+
     def setup(self):
         config = self.config
 
@@ -441,6 +485,9 @@ class Trainer:
 
         total_params = self.model.get_num_params()
         print(f"Model parameters: {total_params:,} ({total_params/1e6:.0f}M)")
+
+        # [NEW] Run Sanity Checks
+        self._run_sanity_checks()
 
         if config.use_torch_compile and self.device_type == "cuda" and hasattr(torch, 'compile'):
             print(f"Compiling model with mode: {config.compile_mode}")
