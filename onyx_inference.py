@@ -52,27 +52,29 @@ def load_model(checkpoint_path: str, device: torch.device, dtype: torch.dtype, m
         cfg = checkpoint['config']
         if isinstance(cfg, dict) and 'model_config_path' in cfg:
             mcp = cfg['model_config_path']
-            ckpt_dir = Path(checkpoint_path).parent
-            possible_paths = [
-                ckpt_dir / mcp,
-                ckpt_dir.parent / mcp,
-                Path(mcp),
-            ]
-            for p in possible_paths:
-                if p.exists():
-                    print(f"Loading model config from checkpoint reference: {p}")
-                    with open(p) as f:
-                        cfg_json = json.load(f)
-                    flat_cfg = {}
-                    for key, value in cfg_json.items():
-                        if isinstance(value, dict):
-                            flat_cfg.update(value)
-                        else:
-                            flat_cfg[key] = value
-                    valid_fields = {f.name for f in dataclasses.fields(OnyxConfig)}
-                    filtered_cfg = {k: v for k, v in flat_cfg.items() if k in valid_fields}
-                    config = OnyxConfig(**filtered_cfg)
-                    break
+            # Some checkpoints store None/empty for model_config_path; skip in that case
+            if isinstance(mcp, (str, Path)) and mcp:
+                ckpt_dir = Path(checkpoint_path).parent
+                possible_paths = [
+                    ckpt_dir / mcp,
+                    ckpt_dir.parent / mcp,
+                    Path(mcp),
+                ]
+                for p in possible_paths:
+                    if p.exists():
+                        print(f"Loading model config from checkpoint reference: {p}")
+                        with open(p) as f:
+                            cfg_json = json.load(f)
+                        flat_cfg = {}
+                        for key, value in cfg_json.items():
+                            if isinstance(value, dict):
+                                flat_cfg.update(value)
+                            else:
+                                flat_cfg[key] = value
+                        valid_fields = {f.name for f in dataclasses.fields(OnyxConfig)}
+                        filtered_cfg = {k: v for k, v in flat_cfg.items() if k in valid_fields}
+                        config = OnyxConfig(**filtered_cfg)
+                        break
 
     if config is None:
         if 'config' in checkpoint:
