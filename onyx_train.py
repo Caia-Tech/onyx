@@ -117,7 +117,8 @@ class TrainingConfig:
 
     # === Precision ===
     use_amp: bool = True
-    amp_dtype: str = "bfloat16"
+    amp_dtype: str = "float16"
+    amp_flag: Optional[bool] = None  # Track CLI request to keep defaults intact
 
     # === Compilation ===
     use_torch_compile: bool = False
@@ -125,6 +126,10 @@ class TrainingConfig:
 
     # === Gradient ===
     gradient_clip: float = 1.0
+
+    # === Benchmarking ===
+    bench_steps: int = 0
+    disable_saves_during_bench: bool = False
 
     # === Checkpointing ===
     save_dir: str = "./checkpoints"
@@ -196,11 +201,29 @@ class StreamingPackedDataset(IterableDataset):
                         continue
                     try:
                         data = json.loads(line)
-                        text = data.get('text') or data.get('content') or data.get('input', '')
-                        if text:
-                            yield text
                     except json.JSONDecodeError:
                         continue
+                    if not isinstance(data, dict):
+                        continue
+
+                    text = data.get('text') or data.get('content') or data.get('input', '')
+
+                    # Support simple chat-style records: {system, user, assistant}
+                    if not text:
+                        system = data.get('system')
+                        user = data.get('user')
+                        assistant = data.get('assistant')
+                        if isinstance(user, str) and isinstance(assistant, str):
+                            user = user.strip()
+                            assistant = assistant.strip()
+                            system = system.strip() if isinstance(system, str) else ""
+                            if system:
+                                text = f"System: {system}\n\nUser: {user}\nAssistant: {assistant}"
+                            else:
+                                text = f"User: {user}\nAssistant: {assistant}"
+
+                    if isinstance(text, str) and text:
+                        yield text
 
     def _tokenize_document(self, text: str) -> List[int]:
         tokens = self.tokenizer.encode(text, add_special_tokens=False)
@@ -306,6 +329,9 @@ class Trainer:
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
+        self.resume_checkpoint_meta = None
+        self.resume_vocab_size = None
+
     def _handle_signal(self, signum, frame):
         print(f"\n[SIGNAL] Received {signum}, will save and exit after current step...")
         self._interrupt_requested = True
@@ -368,8 +394,6 @@ class Trainer:
             self.device = torch.device("mps")
             self.device_type = "mps"
             print("Using MPS (Apple Silicon)")
-            config.amp_dtype = "float32"
-            config.use_amp = False
         else:
             self.device = torch.device("cpu")
             self.device_type = "cpu"
@@ -377,12 +401,32 @@ class Trainer:
             config.use_amp = False
 
         if config.amp_dtype == "bfloat16":
-            self.dtype = torch.bfloat16
+            self.autocast_dtype = torch.bfloat16
         elif config.amp_dtype == "float16":
-            self.dtype = torch.float16
+            self.autocast_dtype = torch.float16
         else:
-            self.dtype = torch.float32
-        print(f"Training dtype: {self.dtype}")
+            self.autocast_dtype = torch.float32
+
+        # Preserve previous default (no AMP on MPS/CPU) unless explicitly requested
+        if self.device_type in ("mps", "cpu") and config.amp_flag is None:
+            config.use_amp = False
+
+        if self.device_type == "cpu" and config.use_amp:
+            print("AMP requested on CPU but not supported; running in fp32.")
+            config.use_amp = False
+
+        if self.device_type == "mps" and config.use_amp:
+            print(f"MPS autocast enabled with dtype: {self.autocast_dtype}")
+        elif self.device_type == "mps":
+            print("MPS autocast disabled (fp32).")
+
+        if self.device_type == "cuda" and not config.use_amp:
+            self.autocast_dtype = torch.float32
+
+        self.use_autocast = config.use_amp and self.device_type in ("cuda", "mps")
+        self.memory_state_dtype = self.autocast_dtype if self.use_autocast else torch.float32
+
+        print(f"Autocast dtype: {self.autocast_dtype} | AMP: {config.use_amp}")
 
         if TRANSFORMERS_AVAILABLE:
             print(f"Loading tokenizer: {config.tokenizer_name}")
@@ -411,6 +455,27 @@ class Trainer:
             pin_memory=(self.device_type == "cuda"),
         )
         self.data_iter = iter(self.dataloader)
+
+        # If resuming and no explicit model_config_path provided, inherit from checkpoint config
+        ckpt_model_config_path = None
+        if config.resume and not config.model_config_path:
+            try:
+                resume_meta = torch.load(config.resume, map_location="cpu", weights_only=False)
+                self.resume_checkpoint_meta = resume_meta
+                if isinstance(resume_meta, dict):
+                    resume_cfg = resume_meta.get("config", {})
+                    ckpt_model_config_path = resume_cfg.get("model_config_path")
+                    if ckpt_model_config_path:
+                        print(f"Inheriting model_config_path from checkpoint: {ckpt_model_config_path}")
+                        config.model_config_path = ckpt_model_config_path
+                    # Capture vocab size from checkpoint weights for later resizing
+                    msd = resume_meta.get("model_state_dict", {})
+                    vocab_keys = [k for k in ["embed.weight", "lm_head.weight"] if k in msd]
+                    for vk in vocab_keys:
+                        self.resume_vocab_size = msd[vk].shape[0]
+                        break
+            except Exception as e:
+                print(f"Warning: Could not read checkpoint config from {config.resume}: {e}")
 
         # Load model config from JSON, init_checkpoint, or use defaults
         if config.model_config_path:
@@ -464,6 +529,16 @@ class Trainer:
                 max_seq_len=config.max_seq_len,
                 train_seq_len=config.max_seq_len,
             )
+
+        # Align vocab size with tokenizer and/or checkpoint if available
+        tokenizer_vocab_size = len(self.tokenizer)
+        target_vocab_size = tokenizer_vocab_size
+        if self.resume_vocab_size is not None:
+            # Preserve checkpoint vocab if tokenizer is larger to avoid shifting IDs
+            target_vocab_size = max(tokenizer_vocab_size, self.resume_vocab_size)
+        if target_vocab_size != model_config.vocab_size:
+            print(f"Adjusting model vocab_size from {model_config.vocab_size} to {target_vocab_size} to match tokenizer/checkpoint.")
+            model_config.vocab_size = target_vocab_size
 
         print(f"Model config: d_model={model_config.d_model}, n_layers={model_config.n_layers}, "
               f"n_heads={model_config.n_heads}")
@@ -534,12 +609,21 @@ class Trainer:
             print(f"Total training steps: {self.total_steps:,}")
 
         self.scaler = None
-        if config.use_amp and self.device_type == "cuda" and config.amp_dtype == "float16":
-            self.scaler = torch.amp.GradScaler('cuda')
+        if config.use_amp and config.amp_dtype == "float16":
+            if self.device_type == "cuda":
+                self.scaler = torch.amp.GradScaler('cuda')
+            elif self.device_type == "mps":
+                try:
+                    self.scaler = torch.amp.GradScaler('mps')
+                    print("Using GradScaler on MPS.")
+                except Exception as e:
+                    print(f"GradScaler not available on MPS, running without scaler: {e}")
 
         self.global_step = 0
         self.tokens_seen = 0
         self.best_loss = float('inf')
+        self.lr_scheduler_state = None
+        self.current_epoch = 0
 
         if config.resume:
             self.load_checkpoint(config.resume)
@@ -586,12 +670,13 @@ class Trainer:
     def train_step(self, memory_states: Optional[List[Dict[str, Any]]] = None):
         config = self.config
         self.model.train()
+        step_start = time.time()
 
         if memory_states is None:
             memory_states = self.model.init_memory_states(
                 config.batch_size,
                 self.device,
-                self.dtype if self.device_type == "cuda" else torch.float32,
+                self.memory_state_dtype,
             )
 
         self.optimizer.zero_grad()
@@ -644,8 +729,19 @@ class Trainer:
 
             memory_states = self.model.detach_memory_states(memory_states)
 
-            if config.use_amp and self.device_type == "cuda":
-                with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
+            if self.use_autocast and self.device_type == "cuda":
+                with torch.amp.autocast(device_type="cuda", dtype=self.autocast_dtype):
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        labels=labels,
+                        memory_states=memory_states,
+                        update_memories=True,
+                        return_memory_reg_loss=True,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                    )
+            elif self.use_autocast and self.device_type == "mps":
+                with torch.autocast(device_type="mps", dtype=self.autocast_dtype):
                     outputs = self.model(
                         input_ids=input_ids,
                         labels=labels,
@@ -679,6 +775,9 @@ class Trainer:
             if isinstance(mem_reg_loss, torch.Tensor) and mem_reg_loss.item() > 0:
                 combined_loss = loss + mem_reg_loss
 
+            if self.scaler is None and not torch.isfinite(combined_loss).all():
+                self._handle_non_finite_loss(combined_loss)
+
             if self.scaler is not None:
                 self.scaler.scale(combined_loss).backward()
             else:
@@ -711,6 +810,7 @@ class Trainer:
 
         avg_loss = total_loss / self.accumulation_steps
         avg_mem_reg = total_mem_reg_loss / self.accumulation_steps if self.accumulation_steps > 0 else 0
+        step_time = time.time() - step_start
 
         return {
             "loss": avg_loss,
@@ -718,6 +818,7 @@ class Trainer:
             "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
             "lr": lr,
             "tokens": total_tokens,
+            "step_time": step_time,
         }, memory_states
 
     def get_memory_stats(self, memory_states: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -745,39 +846,54 @@ class Trainer:
 
         return stats
 
+    def _handle_non_finite_loss(self, loss_tensor):
+        print(f"[ERROR] Non-finite loss detected: {loss_tensor}")
+        self.save_checkpoint("nan")
+        sys.exit(1)
+
     def train(self):
         if not self.setup_complete:
             self.setup()
 
         config = self.config
+        bench_mode = config.bench_steps and config.bench_steps > 0
+        bench_target_step = self.global_step + config.bench_steps if bench_mode else None
+        bench_start_step = self.global_step
 
-        # Count actual tokens in dataset if train_tokens_target is None
-        if config.train_tokens_target is None:
-            print("Counting tokens in dataset (this may take a moment)...")
-            dataset_tokens = 0
-            for batch in self.dataset:
-                dataset_tokens += batch['input_ids'].numel()
-            # Reset dataset iterator
-            self.dataset = StreamingPackedDataset(
-                data_glob=config.data_glob,
-                tokenizer=self.tokenizer,
-                max_seq_len=config.max_seq_len,
-                pack=config.pack_sequences,
-                seed=config.seed,
-            )
-            self.dataloader = DataLoader(
-                self.dataset,
-                batch_size=config.batch_size,
-                num_workers=0,
-                pin_memory=True,
-            )
-            self.data_iter = iter(self.dataloader)
-            print(f"Dataset contains {dataset_tokens:,} tokens")
+        if bench_mode:
+            print(f"Benchmark mode: running {config.bench_steps} step(s) then exiting.")
+            dataset_tokens = config.tokens_per_step * config.bench_steps
+            steps_per_epoch = max(1, config.bench_steps)
+            total_steps = bench_target_step
         else:
-            dataset_tokens = config.train_tokens_target
+            # Count actual tokens in dataset if train_tokens_target is None
+            if config.train_tokens_target is None:
+                print("Counting tokens in dataset (this may take a moment)...")
+                dataset_tokens = 0
+                for batch in self.dataset:
+                    dataset_tokens += batch['input_ids'].numel()
+                # Reset dataset iterator
+                self.dataset = StreamingPackedDataset(
+                    data_glob=config.data_glob,
+                    tokenizer=self.tokenizer,
+                    max_seq_len=config.max_seq_len,
+                    pack=config.pack_sequences,
+                    seed=config.seed,
+                )
+                self.dataloader = DataLoader(
+                    self.dataset,
+                    batch_size=config.batch_size,
+                    num_workers=0,
+                    pin_memory=True,
+                )
+                self.data_iter = iter(self.dataloader)
+                print(f"Dataset contains {dataset_tokens:,} tokens")
+            else:
+                dataset_tokens = config.train_tokens_target
 
-        steps_per_epoch = max(1, dataset_tokens // config.tokens_per_step)
-        total_steps = steps_per_epoch * config.num_epochs
+            steps_per_epoch = max(1, dataset_tokens // config.tokens_per_step)
+            total_steps = steps_per_epoch * config.num_epochs
+
         self.total_steps = total_steps  # Update instance variable
 
         print("=" * 70)
@@ -793,7 +909,11 @@ class Trainer:
         log_loss = 0.0
         log_tokens = 0
         log_steps = 0
-        current_epoch = 0
+        current_epoch = self.current_epoch
+        bench_tokens = 0
+        bench_time = 0.0
+        bench_ema_tokps = None
+        bench_alpha = 0.1
 
         while self.global_step < total_steps:
             if self._interrupt_requested:
@@ -802,14 +922,16 @@ class Trainer:
                 print("Checkpoint saved. Exiting.")
                 break
 
-            new_epoch = self.global_step // steps_per_epoch
-            if new_epoch > current_epoch:
-                current_epoch = new_epoch
-                print(f"\n{'='*70}")
-                print(f"Epoch {current_epoch} complete")
-                print(f"{'='*70}\n")
-                if config.save_every_epoch:
-                    self.save_checkpoint(f"epoch_{current_epoch}")
+            if not bench_mode:
+                new_epoch = self.global_step // steps_per_epoch
+                if new_epoch > current_epoch:
+                    current_epoch = new_epoch
+                    print(f"\n{'='*70}")
+                    print(f"Epoch {current_epoch} complete")
+                    print(f"{'='*70}\n")
+                    self.current_epoch = current_epoch
+                    if config.save_every_epoch and not (bench_mode and config.disable_saves_during_bench):
+                        self.save_checkpoint(f"epoch_{current_epoch}")
 
             metrics, memory_states = self.train_step(memory_states)
             if metrics is None:
@@ -823,7 +945,11 @@ class Trainer:
                 elapsed = time.time() - start_time
                 avg_loss = log_loss / log_steps if log_steps > 0 else 0
                 tokens_per_sec = log_tokens / elapsed if elapsed > 0 else 0
-                epoch_progress = (self.global_step % steps_per_epoch) / steps_per_epoch * 100
+                if bench_mode:
+                    bench_done = self.global_step - bench_start_step
+                    epoch_progress = bench_done / max(1, config.bench_steps) * 100
+                else:
+                    epoch_progress = (self.global_step % steps_per_epoch) / steps_per_epoch * 100
 
                 mem_stats = self.get_memory_stats(memory_states)
 
@@ -851,8 +977,27 @@ class Trainer:
                 log_steps = 0
                 start_time = time.time()
 
-            if config.save_every_steps > 0 and self.global_step % config.save_every_steps == 0:
+            if (config.save_every_steps > 0 and
+                self.global_step % config.save_every_steps == 0 and
+                    not (bench_mode and config.disable_saves_during_bench)):
                 self.save_checkpoint(f"step_{self.global_step}")
+
+            if bench_mode:
+                bench_tokens += metrics["tokens"]
+                bench_time += metrics["step_time"]
+                inst_tokps = metrics["tokens"] / max(metrics["step_time"], 1e-8)
+                bench_ema_tokps = inst_tokps if bench_ema_tokps is None else (1 - bench_alpha) * bench_ema_tokps + bench_alpha * inst_tokps
+                steps_done = self.global_step - (bench_target_step - config.bench_steps)
+                if steps_done >= config.bench_steps:
+                    bench_avg = bench_tokens / bench_time if bench_time > 0 else 0.0
+                    print(f"\nBench avg tok/s: {bench_avg:.2f}")
+                    if bench_ema_tokps is not None:
+                        print(f"Bench ema tok/s: {bench_ema_tokps:.2f}")
+                    print(f"Bench steps: {config.bench_steps}")
+                    ckpt_suffix = "bench_amp" if self.use_autocast else "bench_fp32"
+                    self.save_checkpoint(f"{ckpt_suffix}_step{self.global_step:04d}")
+                    print("Benchmark complete. Exiting.")
+                    return
 
         if not self._interrupt_requested:
             self.save_checkpoint(f"epoch_{config.num_epochs}_final")
@@ -869,12 +1014,17 @@ class Trainer:
         if hasattr(model, '_orig_mod'):
             model = model._orig_mod
 
+        if self.lr_scheduler_state is None:
+            self.lr_scheduler_state = {"global_step": self.global_step}
+
         checkpoint = {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "global_step": self.global_step,
             "tokens_seen": self.tokens_seen,
             "best_loss": self.best_loss,
+            "current_epoch": getattr(self, "current_epoch", 0),
+            "lr_scheduler_state_dict": {"global_step": self.global_step} if self.lr_scheduler_state is None else self.lr_scheduler_state,
             "config": vars(config),
         }
 
@@ -894,11 +1044,49 @@ class Trainer:
         if hasattr(model, '_orig_mod'):
             model = model._orig_mod
 
-        model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = checkpoint["model_state_dict"]
+
+        def _resize_vocab_weights(key: str, target_tensor: torch.Tensor):
+            if key not in state_dict:
+                return
+            tensor = state_dict[key]
+            if tensor.shape == target_tensor.shape:
+                return
+            if tensor.ndim != target_tensor.ndim or tensor.shape[1:] != target_tensor.shape[1:]:
+                return
+            new_tensor = torch.zeros_like(target_tensor)
+            rows_to_copy = min(tensor.shape[0], target_tensor.shape[0])
+            new_tensor[:rows_to_copy] = tensor[:rows_to_copy]
+            state_dict[key] = new_tensor
+            print(f"Resized checkpoint tensor {key} from {tuple(tensor.shape)} to {tuple(target_tensor.shape)}")
+
+        if hasattr(model, "embed"):
+            _resize_vocab_weights("embed.weight", model.embed.weight)
+        if hasattr(model, "lm_head"):
+            _resize_vocab_weights("lm_head.weight", model.lm_head.weight)
+
+        model.load_state_dict(state_dict)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # Resize optimizer state tensors if vocab dims changed
+        for p, state in self.optimizer.state.items():
+            if not isinstance(state, dict):
+                continue
+            for key in ("exp_avg", "exp_avg_sq", "slow_avg"):
+                if key in state:
+                    t = state[key]
+                    if t.shape != p.shape:
+                        new_t = torch.zeros_like(p)
+                        common = tuple(slice(0, min(a, b)) for a, b in zip(t.shape, new_t.shape))
+                        new_t[common] = t[common]
+                        state[key] = new_t
+                        print(f"Resized optimizer state {key} for param with shape {tuple(t.shape)} -> {tuple(new_t.shape)}")
+
         self.global_step = checkpoint["global_step"]
         self.tokens_seen = checkpoint["tokens_seen"]
         self.best_loss = checkpoint.get("best_loss", float('inf'))
+        self.current_epoch = checkpoint.get("current_epoch", 0)
+        self.lr_scheduler_state = checkpoint.get("lr_scheduler_state_dict")
 
         if self.scaler is not None and "scaler_state_dict" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
@@ -943,6 +1131,14 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--compile_mode", type=str, default="reduce-overhead")
 
+    parser.add_argument("--amp", action="store_true", default=None,
+                        help="Enable mixed precision autocast")
+    parser.add_argument("--amp_dtype", type=str, choices=["float16", "bfloat16"], default="float16")
+    parser.add_argument("--bench_steps", type=int, default=0,
+                        help="If >0, run this many steps then exit after saving a checkpoint")
+    parser.add_argument("--disable_saves_during_bench", action="store_true",
+                        help="Skip periodic checkpoint saves during benchmarking")
+
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--save_every_steps", type=int, default=0)
     parser.add_argument("--resume", type=str, default=None)
@@ -958,6 +1154,9 @@ def main():
 
     args = parser.parse_args()
 
+    amp_default = TrainingConfig.__dataclass_fields__["use_amp"].default
+    use_amp = args.amp if args.amp is not None else amp_default
+
     config = TrainingConfig(
         tokenizer_name=args.tokenizer,
         batch_size=args.batch_size,
@@ -972,6 +1171,11 @@ def main():
         use_m3_optimizer=not args.use_adamw,
         use_torch_compile=args.compile,
         compile_mode=args.compile_mode,
+        use_amp=use_amp,
+        amp_dtype=args.amp_dtype,
+        amp_flag=args.amp,
+        bench_steps=args.bench_steps,
+        disable_saves_during_bench=args.disable_saves_during_bench,
         save_dir=args.save_dir,
         save_every_steps=args.save_every_steps,
         resume=args.resume,

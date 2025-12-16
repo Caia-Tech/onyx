@@ -8,7 +8,7 @@
         "n_heads": 8,
         "n_kv_heads": 2,
         "d_ff": 4096,
-        "vocab_size": 128258,
+        "vocab_size": 128257,
         "max_seq_len": 8192,
         "rope_theta": 500000.0,
         "norm_eps": 1e-5
