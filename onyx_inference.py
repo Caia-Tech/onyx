@@ -142,6 +142,8 @@ def sample_token(
     min_p: float = 0.0,
     repetition_penalty: float = 1.0,
     generated_tokens: Optional[torch.Tensor] = None,
+    min_tokens_before_eos: int = 5,
+    stop_on_eos: bool = True,
 ) -> torch.Tensor:
     """Sample next token with various strategies"""
 
@@ -201,6 +203,8 @@ def generate_stream(
     eos_token_id: Optional[int] = None,
     stop_tokens: Optional[List[int]] = None,
     use_kv_cache: bool = True,
+    min_tokens_before_eos: int = 5,
+    stop_on_eos: bool = True,
 ) -> Generator[Tuple[torch.Tensor, List[Dict[str, Any]]], None, None]:
     """Generate tokens one at a time, yielding each token"""
 
@@ -227,12 +231,16 @@ def generate_stream(
 
     generated_tokens = torch.tensor([], dtype=torch.long, device=device)
     stop_tokens = stop_tokens or []
-    if eos_token_id is not None:
+    if stop_on_eos and eos_token_id is not None:
         stop_tokens.append(eos_token_id)
 
     for _ in range(max_new_tokens):
         with torch.no_grad():
             logits = outputs["logits"][:, -1:, :]
+
+            # Avoid instantly sampling EOS on fresh prompts
+            if eos_token_id is not None and generated_tokens.numel() < min_tokens_before_eos:
+                logits[:, :, eos_token_id] = float("-inf")
 
             next_token = sample_token(
                 logits.squeeze(1),
@@ -304,17 +312,9 @@ def chat(
         memory_states = model.load_memory_states(memory_path, device, dtype)
         print(f"[Loaded memory from {memory_path}]\n")
 
-    # Get special tokens
+    # Get special tokens (minimal, but include EOS so we can stop after some output)
     eos_token_id = tokenizer.eos_token_id
-    stop_tokens = [eos_token_id] if eos_token_id else []
-
-    # Explicit Llama-3 Stop Tokens
-    llama3_stops = ["<|eot_id|>", "<|end_of_text|>", "<|im_end|>", "<|end|>", "</s>"]
-    for token in llama3_stops:
-        token_id = tokenizer.convert_tokens_to_ids(token)
-        if token_id != tokenizer.unk_token_id and token_id not in stop_tokens:
-            stop_tokens.append(token_id)
-            
+    stop_tokens = [eos_token_id] if eos_token_id is not None else []
     print(f"[Debug] Stop Tokens: {stop_tokens}")
 
     while True:
@@ -382,7 +382,11 @@ def chat(
 
         prompt += f"User: {user_input}\nAssistant:"
 
-        input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+        # Avoid auto-appending special tokens (e.g., eos) which can cause immediate stops.
+        input_ids = tokenizer.encode(prompt, return_tensors='pt', add_special_tokens=False).to(device)
+        if tokenizer.bos_token_id is not None:
+            bos = torch.tensor([[tokenizer.bos_token_id]], device=device)
+            input_ids = torch.cat([bos, input_ids], dim=1)
 
         update_memory = learning or (memory_mode != "stateless")
 
@@ -407,7 +411,12 @@ def chat(
                 update_memory=update_memory,
                 eos_token_id=eos_token_id,
                 stop_tokens=stop_tokens,
+                min_tokens_before_eos=8,
+                stop_on_eos=True,  # stop on EOS but only after a few tokens
             ):
+                tid = token.item()
+                if eos_token_id is not None and tid == eos_token_id:
+                    continue  # skip printing bare EOS tokens
                 token_text = tokenizer.decode(token[0], skip_special_tokens=True)
                 print(token_text, end="", flush=True)
                 generated_text += token_text
@@ -424,7 +433,7 @@ def chat(
                 memory_mode=memory_mode if not learning else "session",
                 memory_path=memory_path if memory_mode == "persistent" and not learning else None,
                 update_memory=update_memory,
-                eos_token_id=eos_token_id,
+                eos_token_id=None,
             )
             generated_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
             token_count = output_ids.shape[1] - input_ids.shape[1]
@@ -528,16 +537,14 @@ def main():
         if args.system:
             prompt = f"System: {args.system}\n\nUser: {prompt}\nAssistant:"
 
-        input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+        input_ids = tokenizer.encode(prompt, return_tensors='pt', add_special_tokens=False).to(device)
+        if tokenizer.bos_token_id is not None:
+            bos = torch.tensor([[tokenizer.bos_token_id]], device=device)
+            input_ids = torch.cat([bos, input_ids], dim=1)
         
-        # Stop tokens for single prompt
+        # Stop tokens for single prompt (keep empty to avoid premature stops)
         eos_token_id = tokenizer.eos_token_id
-        stop_tokens = [eos_token_id] if eos_token_id else []
-        llama3_stops = ["<|eot_id|>", "<|end_of_text|>", "<|im_end|>", "</s>"]
-        for token in llama3_stops:
-            token_id = tokenizer.convert_tokens_to_ids(token)
-            if token_id != tokenizer.unk_token_id and token_id not in stop_tokens:
-                stop_tokens.append(token_id)
+        stop_tokens = [eos_token_id] if eos_token_id is not None else []
 
         if stream:
             for token, _ in generate_stream(
@@ -552,8 +559,13 @@ def main():
                 memory_mode=args.memory,
                 update_memory=args.learning,
                 eos_token_id=eos_token_id,
-                stop_tokens=stop_tokens
+                stop_tokens=stop_tokens,
+                min_tokens_before_eos=8,
+                stop_on_eos=True,
             ):
+                tid = token.item()
+                if eos_token_id is not None and tid == eos_token_id:
+                    continue
                 print(tokenizer.decode(token[0], skip_special_tokens=True), end="", flush=True)
             print()
         else:

@@ -279,18 +279,49 @@ class StreamingPackedDataset(IterableDataset):
             current_boundaries.append(self.max_seq_len)
             yield current_seq[:self.max_seq_len], current_boundaries
 
+    def _simple_sequences(self) -> Iterator[List[int]]:
+        """Yield fixed-length sequences without boundary tracking."""
+        rng = random.Random(self.seed)
+        docs = list(self._read_documents())
+        rng.shuffle(docs)
+
+        buf: List[int] = []
+        for doc in docs:
+            tokens = self._tokenize_document(doc)
+            if not tokens:
+                continue
+            tokens.append(self.eod_token_id)
+            buf.extend(tokens)
+
+            while len(buf) >= self.max_seq_len:
+                yield buf[:self.max_seq_len]
+                buf = buf[self.max_seq_len:]
+
+        if buf:
+            if len(buf) < self.max_seq_len:
+                buf.extend([self.eod_token_id] * (self.max_seq_len - len(buf)))
+            yield buf[:self.max_seq_len]
+
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        for seq, boundaries in self._pack_sequences_with_boundaries():
-            input_ids = torch.tensor(seq, dtype=torch.long)
-            # Convert boundaries to cu_seqlens format (cumulative sequence lengths)
-            cu_seqlens = torch.tensor(boundaries, dtype=torch.int32)
-            max_seqlen = max(boundaries[i+1] - boundaries[i] for i in range(len(boundaries)-1)) if len(boundaries) > 1 else len(seq)
-            yield {
-                "input_ids": input_ids,
-                "labels": input_ids.clone(),
-                "cu_seqlens": cu_seqlens,
-                "max_seqlen": max_seqlen,
-            }
+        if self.pack:
+            for seq, boundaries in self._pack_sequences_with_boundaries():
+                input_ids = torch.tensor(seq, dtype=torch.long)
+                # Convert boundaries to cu_seqlens format (cumulative sequence lengths)
+                cu_seqlens = torch.tensor(boundaries, dtype=torch.int32)
+                max_seqlen = max(boundaries[i+1] - boundaries[i] for i in range(len(boundaries)-1)) if len(boundaries) > 1 else len(seq)
+                yield {
+                    "input_ids": input_ids,
+                    "labels": input_ids.clone(),
+                    "cu_seqlens": cu_seqlens,
+                    "max_seqlen": max_seqlen,
+                }
+        else:
+            for seq in self._simple_sequences():
+                input_ids = torch.tensor(seq, dtype=torch.long)
+                yield {
+                    "input_ids": input_ids,
+                    "labels": input_ids.clone(),
+                }
 
 
 # =============================================================================
@@ -891,7 +922,7 @@ class Trainer:
             else:
                 dataset_tokens = config.train_tokens_target
 
-            steps_per_epoch = max(1, dataset_tokens // config.tokens_per_step)
+            steps_per_epoch = max(1, math.ceil(dataset_tokens / config.tokens_per_step))
             total_steps = steps_per_epoch * config.num_epochs
 
         self.total_steps = total_steps  # Update instance variable
@@ -1119,6 +1150,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_seq_len", type=int, default=256)
     parser.add_argument("--tokens_per_step", type=int, default=8192)
+    parser.add_argument("--no_pack_sequences", action="store_false", dest="pack_sequences",
+                        help="Disable packing; use fixed-length chunks instead.")
     parser.add_argument("--num_epochs", type=int, default=2)
     parser.add_argument("--train_tokens_target", type=int, default=None)
     parser.add_argument("--max_steps", type=int, default=None)
@@ -1162,6 +1195,7 @@ def main():
         batch_size=args.batch_size,
         max_seq_len=args.max_seq_len,
         tokens_per_step=args.tokens_per_step,
+        pack_sequences=args.pack_sequences,
         num_epochs=args.num_epochs,
         train_tokens_target=args.train_tokens_target,
         max_steps=args.max_steps,
