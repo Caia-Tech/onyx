@@ -89,6 +89,7 @@ class TrainingConfig:
     # === Sequence ===
     max_seq_len: int = 256
     pack_sequences: bool = True
+    drop_remainder: bool = False  # If True, drop final partial chunk instead of padding.
 
     # === Batch & Accumulation ===
     batch_size: int = 4
@@ -164,12 +165,19 @@ class StreamingPackedDataset(IterableDataset):
         max_seq_len: int = 2048,
         pack: bool = True,
         seed: int = 42,
+        drop_remainder: bool = False,
+        emit_cu_seqlens: bool = True,
     ):
         self.data_glob = data_glob
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.pack = pack
         self.seed = seed
+        # If True, drop the final partial chunk instead of padding it to max_seq_len.
+        # This avoids training on padded tokens at the cost of losing up to (max_seq_len-1) tokens per epoch.
+        self.drop_remainder = drop_remainder
+        # When False, do not emit cu_seqlens/max_seqlen (avoids ragged stacking on non-CUDA devices).
+        self.emit_cu_seqlens = emit_cu_seqlens
 
         self.data_files = self._get_files()
         if not self.data_files:
@@ -260,7 +268,7 @@ class StreamingPackedDataset(IterableDataset):
                 # Add the end boundary
                 seq_boundaries.append(self.max_seq_len)
 
-                yield seq_to_yield, seq_boundaries
+                yield seq_to_yield, seq_boundaries, None
 
                 # Remainder becomes new sequence
                 current_seq = current_seq[self.max_seq_len:]
@@ -270,16 +278,17 @@ class StreamingPackedDataset(IterableDataset):
                 # If current doc continues into remainder, it starts at 0
 
         # Handle final partial sequence
-        if current_seq:
+        if current_seq and not self.drop_remainder:
+            pad_start = None
             if len(current_seq) < self.max_seq_len:
                 # Pad and mark the padding boundary
                 pad_start = len(current_seq)
                 current_seq.extend([self.eod_token_id] * (self.max_seq_len - len(current_seq)))
                 current_boundaries.append(pad_start)
             current_boundaries.append(self.max_seq_len)
-            yield current_seq[:self.max_seq_len], current_boundaries
+            yield current_seq[:self.max_seq_len], current_boundaries, pad_start
 
-    def _simple_sequences(self) -> Iterator[List[int]]:
+    def _simple_sequences(self) -> Iterator[tuple]:
         """Yield fixed-length sequences without boundary tracking."""
         rng = random.Random(self.seed)
         docs = list(self._read_documents())
@@ -294,33 +303,43 @@ class StreamingPackedDataset(IterableDataset):
             buf.extend(tokens)
 
             while len(buf) >= self.max_seq_len:
-                yield buf[:self.max_seq_len]
+                yield buf[:self.max_seq_len], None
                 buf = buf[self.max_seq_len:]
 
-        if buf:
+        if buf and not self.drop_remainder:
+            pad_start = None
             if len(buf) < self.max_seq_len:
+                pad_start = len(buf)
                 buf.extend([self.eod_token_id] * (self.max_seq_len - len(buf)))
-            yield buf[:self.max_seq_len]
+            yield buf[:self.max_seq_len], pad_start
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         if self.pack:
-            for seq, boundaries in self._pack_sequences_with_boundaries():
+            for seq, boundaries, pad_start in self._pack_sequences_with_boundaries():
                 input_ids = torch.tensor(seq, dtype=torch.long)
-                # Convert boundaries to cu_seqlens format (cumulative sequence lengths)
-                cu_seqlens = torch.tensor(boundaries, dtype=torch.int32)
+                labels = input_ids.clone()
+                if pad_start is not None and pad_start < len(labels):
+                    labels[pad_start:] = -100
                 max_seqlen = max(boundaries[i+1] - boundaries[i] for i in range(len(boundaries)-1)) if len(boundaries) > 1 else len(seq)
-                yield {
+                sample = {
                     "input_ids": input_ids,
-                    "labels": input_ids.clone(),
-                    "cu_seqlens": cu_seqlens,
-                    "max_seqlen": max_seqlen,
+                    "labels": labels,
                 }
+                if self.emit_cu_seqlens:
+                    # Convert boundaries to cu_seqlens format (cumulative sequence lengths)
+                    cu_seqlens = torch.tensor(boundaries, dtype=torch.int32)
+                    sample["cu_seqlens"] = cu_seqlens
+                    sample["max_seqlen"] = max_seqlen
+                yield sample
         else:
-            for seq in self._simple_sequences():
+            for seq, pad_start in self._simple_sequences():
                 input_ids = torch.tensor(seq, dtype=torch.long)
+                labels = input_ids.clone()
+                if pad_start is not None:
+                    labels[pad_start:] = -100
                 yield {
                     "input_ids": input_ids,
-                    "labels": input_ids.clone(),
+                    "labels": labels,
                 }
 
 
@@ -477,6 +496,8 @@ class Trainer:
             max_seq_len=config.max_seq_len,
             pack=config.pack_sequences,
             seed=config.seed,
+            drop_remainder=config.drop_remainder,
+            emit_cu_seqlens=(self.device_type == "cuda"),
         )
 
         self.dataloader = DataLoader(
@@ -910,6 +931,8 @@ class Trainer:
                     max_seq_len=config.max_seq_len,
                     pack=config.pack_sequences,
                     seed=config.seed,
+                    drop_remainder=config.drop_remainder,
+                    emit_cu_seqlens=(self.device_type == "cuda"),
                 )
                 self.dataloader = DataLoader(
                     self.dataset,
@@ -1152,6 +1175,8 @@ def main():
     parser.add_argument("--tokens_per_step", type=int, default=8192)
     parser.add_argument("--no_pack_sequences", action="store_false", dest="pack_sequences",
                         help="Disable packing; use fixed-length chunks instead.")
+    parser.add_argument("--drop_remainder", action="store_true",
+                        help="Drop the final partial sequence instead of padding it.")
     parser.add_argument("--num_epochs", type=int, default=2)
     parser.add_argument("--train_tokens_target", type=int, default=None)
     parser.add_argument("--max_steps", type=int, default=None)
@@ -1196,6 +1221,7 @@ def main():
         max_seq_len=args.max_seq_len,
         tokens_per_step=args.tokens_per_step,
         pack_sequences=args.pack_sequences,
+        drop_remainder=args.drop_remainder,
         num_epochs=args.num_epochs,
         train_tokens_target=args.train_tokens_target,
         max_steps=args.max_steps,
