@@ -3,16 +3,11 @@
 Onyx 11M - Hope Attention Transformer with Persistent Memory
 
 Core model code (OnyxConfig, Onyx, M3Optimizer, param grouping).
-
-Notes:
-- Memory updates happen when `update_memories=True`.
-- Memory persistence to disk is handled by inference/training scripts, not here.
 """
 
 import math
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List, Callable
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -33,7 +28,7 @@ except Exception:
 
 @dataclass
 class OnyxConfig:
-    # === Core Architecture (~11M params excluding vocab embeddings) ===
+    # === Core Architecture ===
     d_model: int = 384
     n_layers: int = 6
     n_heads: int = 6
@@ -44,7 +39,7 @@ class OnyxConfig:
     # === Sequence & Vocab ===
     max_seq_len: int = 4096
     train_seq_len: int = 4096
-    vocab_size: int = 128258  # can be overridden by training/inference loaders
+    vocab_size: int = 128258
 
     # === RoPE ===
     rope_base: float = 500000.0
@@ -69,7 +64,7 @@ class OnyxConfig:
     conv_kernel_size: int = 4
     use_memory_gate: bool = True
 
-    # === Delta Memory (Training) ===
+    # === Delta Memory ===
     memory_type: str = "linear"
     use_delta_rule: bool = True
     normalize_keys: bool = True
@@ -153,7 +148,6 @@ def rotate_half(x: Tensor) -> Tensor:
 
 
 def apply_rotary_pos_emb(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
-    # q, k: [..., S, D], cos/sin: [1 or ..., S, D]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -194,30 +188,17 @@ class ChunkedLinearDeltaMemory(nn.Module):
             x = max(min(float(x), 0.999), 0.001)
             return math.log(x / (1 - x))
 
-        if config.memory_lr_learnable:
-            self.eta_raw = nn.Parameter(torch.tensor(inv_sig(config.memory_lr_init)))
-        else:
-            self.register_buffer("eta_raw", torch.tensor(inv_sig(config.memory_lr_init)))
-
-        if config.memory_decay_learnable:
-            self.alpha_raw = nn.Parameter(torch.tensor(inv_sig(config.memory_decay_init)))
-        else:
-            self.register_buffer("alpha_raw", torch.tensor(inv_sig(config.memory_decay_init)))
-
-        # Dynamic, input-dependent memory hyperparameters (paper Eq. 94 & 95).
-        # We keep eta_raw/alpha_raw as base logits for backward compatibility
-        # with existing checkpoints, and learn input-conditioned deltas via
-        # projections.
+        # Dynamic hyperparams projections
         self.eta_proj = nn.Linear(d_in, 1, bias=True)
         self.alpha_proj = nn.Linear(d_in, 1, bias=True)
         nn.init.zeros_(self.eta_proj.weight)
-        nn.init.zeros_(self.eta_proj.bias)
+        nn.init.constant_(self.eta_proj.bias, inv_sig(config.memory_lr_init))
         nn.init.zeros_(self.alpha_proj.weight)
-        nn.init.zeros_(self.alpha_proj.bias)
+        nn.init.constant_(self.alpha_proj.bias, inv_sig(config.memory_decay_init))
 
-        # Backward compatibility: older checkpoints won't have eta_proj/alpha_proj.
+        # Legacy buffer compatibility hook
         self.register_load_state_dict_post_hook(self._ignore_missing_dynamic_hyperparams)
-
+        
         self.register_buffer("inference_eta", torch.tensor(config.inference_memory_lr))
         self.register_buffer("inference_alpha", torch.tensor(config.inference_memory_decay))
 
@@ -226,28 +207,7 @@ class ChunkedLinearDeltaMemory(nn.Module):
             nn.init.zeros_(self.gate_proj.weight)
             nn.init.constant_(self.gate_proj.bias, 2.0)
 
-    @property
-    def eta(self) -> Tensor:
-        return torch.sigmoid(self.eta_raw) * self.config.max_memory_lr
-
-    @property
-    def alpha(self) -> Tensor:
-        min_d = self.config.min_memory_decay
-        return min_d + torch.sigmoid(self.alpha_raw) * (1 - min_d)
-
-    def get_eta(self, inference_mode: bool = False) -> Tensor:
-        return self.inference_eta if inference_mode else self.eta
-
-    def get_alpha(self, inference_mode: bool = False) -> Tensor:
-        return self.inference_alpha if inference_mode else self.alpha
-
     def _compute_chunk_hyperparams(self, chunk: Tensor, inference_mode: bool) -> Tuple[Tensor, Tensor]:
-        """
-        Returns (eta, alpha) as chunk-wise tensors shaped [B,1,1].
-
-        Uses input-conditioned projections (self-referential), with different
-        base rates for training vs inference.
-        """
         B = chunk.size(0)
         eps = 1e-6
 
@@ -256,21 +216,18 @@ class ChunkedLinearDeltaMemory(nn.Module):
             return torch.log(p / (1.0 - p))
 
         if inference_mode:
-            # In inference_mode, default to the configured inference values when
-            # projections are zero, but allow input-dependent modulation.
-            base_eta = self.inference_eta.to(device=chunk.device, dtype=chunk.dtype)  # in [0, max_lr]
+            base_eta = self.inference_eta.to(device=chunk.device, dtype=chunk.dtype)
             base_eta01 = (base_eta / float(self.config.max_memory_lr)).clamp(min=eps, max=1.0 - eps)
             eta_base_logit = _inv_sigmoid01(base_eta01)
 
             min_d = float(self.config.min_memory_decay)
-            base_alpha = self.inference_alpha.to(device=chunk.device, dtype=chunk.dtype)  # in [0,1]
+            base_alpha = self.inference_alpha.to(device=chunk.device, dtype=chunk.dtype)
             base_alpha01 = ((base_alpha - min_d) / (1.0 - min_d)).clamp(min=eps, max=1.0 - eps)
             alpha_base_logit = _inv_sigmoid01(base_alpha01)
         else:
-            eta_base_logit = self.eta_raw.to(device=chunk.device, dtype=chunk.dtype)
-            alpha_base_logit = self.alpha_raw.to(device=chunk.device, dtype=chunk.dtype)
+            eta_base_logit = torch.tensor(0.0, device=chunk.device, dtype=chunk.dtype)
+            alpha_base_logit = torch.tensor(0.0, device=chunk.device, dtype=chunk.dtype)
 
-        # raw logits per token: [B,C,1]
         eta_raw = eta_base_logit + self.eta_proj(chunk)
         alpha_raw = alpha_base_logit + self.alpha_proj(chunk)
 
@@ -278,7 +235,6 @@ class ChunkedLinearDeltaMemory(nn.Module):
         min_d = self.config.min_memory_decay
         alpha_tok = min_d + torch.sigmoid(alpha_raw) * (1 - min_d)
 
-        # chunk-wise averages: [B,1,1]
         eta = eta_tok.mean(dim=1, keepdim=True)
         alpha = alpha_tok.mean(dim=1, keepdim=True)
         return eta, alpha
@@ -298,26 +254,25 @@ class ChunkedLinearDeltaMemory(nn.Module):
         update_memory: bool,
         target_generator: Optional[Callable[[Tensor], Tensor]] = None,
     ) -> Tuple[Tensor, Tensor]:
-        # chunk: [B, C, d_in]
         outputs = self.retrieve_batch(M, chunk)
         if not update_memory:
             return outputs, M
 
         keys = normalize_for_delta(chunk, dim=-1, eps=self.config.norm_eps) if self.config.normalize_keys else chunk
 
-        k_mean = keys.mean(dim=1)      # [B, d_in]
-        # Self-generated targets (Hope): allow the model to decide what value it
-        # "wished" it had retrieved, then learn that mapping via the delta rule.
+        k_mean = keys.mean(dim=1)
+        
+        # Feedback Loop Logic
         if target_generator is not None:
             targets = target_generator(outputs)
-            v_target = targets.mean(dim=1)  # [B, d_out]
+            v_target = targets.mean(dim=1)
         else:
-            v_target = outputs.mean(dim=1)  # [B, d_out]
+            v_target = outputs.mean(dim=1)
 
         if self.config.use_delta_rule:
-            Mk = torch.bmm(M, k_mean.unsqueeze(-1)).squeeze(-1)  # [B, d_out]
+            Mk = torch.bmm(M, k_mean.unsqueeze(-1)).squeeze(-1)
             error = v_target - Mk
-            update = torch.bmm(error.unsqueeze(-1), k_mean.unsqueeze(1))  # [B, d_out, d_in]
+            update = torch.bmm(error.unsqueeze(-1), k_mean.unsqueeze(1))
         else:
             update = torch.bmm(v_target.unsqueeze(-1), k_mean.unsqueeze(1))
 
@@ -326,10 +281,9 @@ class ChunkedLinearDeltaMemory(nn.Module):
         M_new = alpha * M + eta * chunk_scale * update
 
         if hasattr(self, "gate_proj"):
-            gate = torch.sigmoid(self.gate_proj(k_mean)).unsqueeze(-1)  # [B,1,1]
+            gate = torch.sigmoid(self.gate_proj(k_mean)).unsqueeze(-1)
             M_new = gate * M_new + (1 - gate) * M
 
-        # clamp norm
         M_norm = torch.norm(M_new, dim=(-2, -1), keepdim=True)
         scale = torch.clamp(self.config.memory_max_norm / (M_norm + 1e-6), max=1.0)
         M_new = M_new * scale
@@ -358,13 +312,12 @@ class ChunkedLinearDeltaMemory(nn.Module):
 
     @staticmethod
     def _ignore_missing_dynamic_hyperparams(module, incompatible_keys) -> None:
-        del module
         missing = incompatible_keys.missing_keys
+        # [FIX] Ignore missing projection keys when loading old checkpoints
         suffixes = (
-            "eta_proj.weight",
-            "eta_proj.bias",
-            "alpha_proj.weight",
-            "alpha_proj.bias",
+            "eta_proj.weight", "eta_proj.bias",
+            "alpha_proj.weight", "alpha_proj.bias",
+            "gate_proj.weight", "gate_proj.bias"
         )
         for i in range(len(missing) - 1, -1, -1):
             if missing[i].endswith(suffixes):
@@ -401,21 +354,21 @@ class ChunkedSelfReferentialMemory(nn.Module):
         inference_mode: bool = False,
         update_memory: bool = True,
     ) -> Tuple[Tensor, Tensor]:
-        def target_gen_fn(retrieved_vals: Tensor) -> Tensor:
-            # Eq 84/87: v_hat = ValueGen(v_t) + v_t
+        
+        # Feedback Generator
+        def target_gen_fn(retrieved_vals):
             if self.value_gen is not None:
                 base = value_input if value_input is not None else retrieved_vals
                 return self.value_gen(base) + base
             return retrieved_vals
 
         outputs, M_new = self.memory(
-            x,
-            M,
-            inference_mode=inference_mode,
+            x, M, 
+            inference_mode=inference_mode, 
             update_memory=update_memory,
-            target_generator=target_gen_fn,
+            target_generator=target_gen_fn 
         )
-
+        
         final_out = target_gen_fn(outputs)
         return final_out, M_new
 
@@ -432,9 +385,7 @@ class CMSFFN(nn.Module):
         super().__init__()
         self.config = config
         self.num_levels = config.cms_num_levels
-        self.d_model = config.d_model
-        self.d_ff = config.d_ff
-
+        
         self.chunk_sizes = [
             config.cms_base_chunk * (config.cms_chunk_multiplier ** i)
             for i in range(self.num_levels)
@@ -479,15 +430,9 @@ class CMSFFN(nn.Module):
 # =============================================================================
 
 def _causal_mask_with_cache(S_q: int, S_k: int, device: torch.device, position_offset: int) -> Tensor:
-    """
-    Returns boolean mask [S_q, S_k] where True means "mask out".
-    For cached path: keys cover positions [0..S_k-1], queries cover positions [position_offset..position_offset+S_q-1].
-    A query at absolute position p can attend to keys with absolute position <= p.
-    """
-    q_pos = (torch.arange(S_q, device=device) + position_offset).unsqueeze(1)  # [S_q,1]
-    k_pos = torch.arange(S_k, device=device).unsqueeze(0)                      # [1,S_k]
-    return k_pos > q_pos  # True => future => mask
-
+    q_pos = (torch.arange(S_q, device=device) + position_offset).unsqueeze(1)
+    k_pos = torch.arange(S_k, device=device).unsqueeze(0)
+    return k_pos > q_pos
 
 class HopeAttention(nn.Module):
     def __init__(self, config: OnyxConfig, layer_idx: int = 0):
@@ -561,7 +506,7 @@ class HopeAttention(nn.Module):
 
             if cache_len > 0 and kv_cache is not None and isinstance(kv_cache, dict) and kv_cache.get("conv_x") is not None:
                 prev = kv_cache["conv_x"]
-                x_cat = torch.cat([prev, x_in], dim=1)  # [B, prev+S, D]
+                x_cat = torch.cat([prev, x_in], dim=1)
                 x_conv_all = self.conv(x_cat.transpose(1, 2))[:, :, : x_cat.size(1)].transpose(1, 2)
                 x_conv = x_conv_all[:, -S:, :]
                 x = x_in + x_conv
@@ -592,14 +537,13 @@ class HopeAttention(nn.Module):
         else:
             v = self.v_proj(x).view(B, S, self.n_kv_heads, self.head_dim)
 
-        # RoPE
         total_seq_len = position_offset + S
         cos, sin = self.rotary(q, total_seq_len)
-        cos = cos[position_offset:position_offset + S].unsqueeze(0)  # [1,S,D]
+        cos = cos[position_offset:position_offset + S].unsqueeze(0)
         sin = sin[position_offset:position_offset + S].unsqueeze(0)
 
-        q = q.transpose(1, 2).contiguous()  # [B,H,S,D]
-        k = k.transpose(1, 2).contiguous()  # [B,Hkv,S,D]
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
 
         q_rope = q.view(B * self.n_heads, S, self.head_dim)
@@ -608,7 +552,6 @@ class HopeAttention(nn.Module):
         q = q_rope.view(B, self.n_heads, S, self.head_dim)
         k = k_rope.view(B, self.n_kv_heads, S, self.head_dim)
 
-        # KV cache concat
         new_kv_cache = None
         if kv_cache is not None:
             if "k" in kv_cache:
@@ -620,7 +563,6 @@ class HopeAttention(nn.Module):
 
         kv_seq_len = k.shape[2]
 
-        # expand kv for GQA
         if self.n_rep > 1:
             k_exp = k.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_heads, kv_seq_len, self.head_dim)
             v_exp = v.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_heads, kv_seq_len, self.head_dim)
@@ -628,12 +570,7 @@ class HopeAttention(nn.Module):
             k_exp = k
             v_exp = v
 
-        # FlashAttention (only non-cached full seq path)
-        if (
-            self.config.use_flash_attention
-            and FLASH_ATTN_AVAILABLE
-            and kv_cache is None
-        ):
+        if self.config.use_flash_attention and FLASH_ATTN_AVAILABLE and kv_cache is None:
             if cu_seqlens is not None and max_seqlen is not None:
                 q_fa = q.transpose(1, 2).reshape(B * S, self.n_heads, self.head_dim)
                 k_fa = k_exp.transpose(1, 2).reshape(B * kv_seq_len, self.n_heads, self.head_dim)
@@ -652,9 +589,8 @@ class HopeAttention(nn.Module):
                 attn_out = attn_out.reshape(B, S, -1)
         else:
             scale = 1.0 / math.sqrt(self.head_dim)
-            attn = torch.matmul(q, k_exp.transpose(-2, -1)) * scale  # [B,H,S,S_k]
+            attn = torch.matmul(q, k_exp.transpose(-2, -1)) * scale
 
-            # Causal mask (FIXED for cached multi-token chunks)
             if kv_cache is None:
                 mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
             else:
@@ -684,7 +620,6 @@ class StandardAttention(nn.Module):
         self.k_proj = nn.Linear(config.d_model, config.n_kv_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(config.d_model, config.n_kv_heads * config.head_dim, bias=False)
         self.o_proj = nn.Linear(config.n_heads * config.head_dim, config.d_model, bias=False)
-
         self.rotary = RotaryEmbedding(config.head_dim, config.max_seq_len, config.rope_base)
 
     def forward(
@@ -693,11 +628,12 @@ class StandardAttention(nn.Module):
         memory_states: Optional[Dict[str, Tensor]] = None,
         update_memories: bool = True,
         inference_mode: bool = False,
+        cu_seqlens: Optional[Tensor] = None, # [FIX] Added missing args to signature
+        max_seqlen: Optional[int] = None,    # [FIX] Added missing args to signature
         kv_cache: Optional[Dict[str, Tensor]] = None,
         position_offset: int = 0,
     ) -> Tuple[Tensor, Dict[str, Tensor], Optional[Dict[str, Tensor]]]:
         B, S, _ = x.shape
-
         q = self.q_proj(x).view(B, S, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(B, S, self.n_kv_heads, self.head_dim)
         v = self.v_proj(x).view(B, S, self.n_kv_heads, self.head_dim)
@@ -718,10 +654,10 @@ class StandardAttention(nn.Module):
         k = k_rope.view(B, self.n_kv_heads, S, self.head_dim)
 
         new_kv_cache = None
-        if kv_cache is not None and "k" in kv_cache:
-            k = torch.cat([kv_cache["k"], k], dim=2)
-            v = torch.cat([kv_cache["v"], v], dim=2)
         if kv_cache is not None:
+            if "k" in kv_cache:
+                k = torch.cat([kv_cache["k"], k], dim=2)
+                v = torch.cat([kv_cache["v"], v], dim=2)
             new_kv_cache = {"k": k, "v": v}
 
         kv_seq_len = k.shape[2]
@@ -750,10 +686,6 @@ class StandardAttention(nn.Module):
 
         return self.o_proj(attn_out), {}, new_kv_cache
 
-
-# =============================================================================
-# Transformer Block
-# =============================================================================
 
 class HopeBlock(nn.Module):
     def __init__(self, config: OnyxConfig, layer_idx: int = 0):
@@ -795,26 +727,16 @@ class HopeBlock(nn.Module):
         attn_mem = memory_states.get("attention", {}) if memory_states else {}
         layer_kv_cache = kv_cache.get("kv", None) if kv_cache else None
 
-        if isinstance(self.attention, HopeAttention):
-            attn_out, new_attn_mem, new_kv = self.attention(
-                self.norm1(x),
-                memory_states=attn_mem,
-                update_memories=update_memories,
-                inference_mode=inference_mode,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                kv_cache=layer_kv_cache,
-                position_offset=position_offset,
-            )
-        else:
-            attn_out, new_attn_mem, new_kv = self.attention(
-                self.norm1(x),
-                memory_states=attn_mem,
-                update_memories=update_memories,
-                inference_mode=inference_mode,
-                kv_cache=layer_kv_cache,
-                position_offset=position_offset,
-            )
+        attn_out, new_attn_mem, new_kv = self.attention(
+            self.norm1(x),
+            memory_states=attn_mem,
+            update_memories=update_memories,
+            inference_mode=inference_mode,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            kv_cache=layer_kv_cache,
+            position_offset=position_offset,
+        )
 
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
@@ -823,10 +745,6 @@ class HopeBlock(nn.Module):
         new_cache = {"kv": new_kv} if new_kv else None
         return x, new_states, new_cache
 
-
-# =============================================================================
-# Full Model
-# =============================================================================
 
 class Onyx(nn.Module):
     def __init__(self, config: OnyxConfig):
@@ -898,13 +816,11 @@ class Onyx(nn.Module):
                 else:
                     layer_cpu[k] = v
             cpu_states.append(layer_cpu)
-
         torch.save({"memory_states": cpu_states, "update_count": self._memory_update_count}, path)
 
     def load_memory_states(self, path: str, device: torch.device, dtype: Optional[torch.dtype] = None) -> List[Dict[str, Any]]:
         ck = torch.load(path, map_location="cpu", weights_only=False)
         self._memory_update_count = ck.get("update_count", 0)
-
         loaded = []
         for layer_mem in ck["memory_states"]:
             layer_loaded = {}
@@ -932,15 +848,12 @@ class Onyx(nn.Module):
         position_offset: int = 0,
     ) -> Dict[str, Any]:
         B, S = input_ids.shape
-
         x = self.embed(input_ids)
         x = self.embed_dropout(x)
 
         if memory_states is None:
             memory_states = [None] * len(self.layers)
         if kv_cache is None:
-            # Enable KV cache by default in inference_mode, but allow callers to
-            # disable by explicitly passing per-layer None caches.
             if inference_mode:
                 kv_cache = [{"kv": {}} for _ in range(len(self.layers))]
             else:
@@ -952,27 +865,14 @@ class Onyx(nn.Module):
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
                 x, new_mem, new_kv = torch.utils.checkpoint.checkpoint(
-                    layer,
-                    x,
-                    memory_states[i],
-                    update_memories,
-                    inference_mode,
-                    cu_seqlens,
-                    max_seqlen,
-                    kv_cache[i],
-                    position_offset,
+                    layer, x, memory_states[i], update_memories, inference_mode,
+                    cu_seqlens, max_seqlen, kv_cache[i], position_offset,
                     use_reentrant=False,
                 )
             else:
                 x, new_mem, new_kv = layer(
-                    x,
-                    memory_states[i],
-                    update_memories,
-                    inference_mode,
-                    cu_seqlens,
-                    max_seqlen,
-                    kv_cache[i],
-                    position_offset,
+                    x, memory_states[i], update_memories, inference_mode,
+                    cu_seqlens, max_seqlen, kv_cache[i], position_offset,
                 )
             new_memory_states.append(new_mem)
             new_kv_cache.append(new_kv)
@@ -1011,44 +911,39 @@ class Onyx(nn.Module):
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power of matrix G.
-    This projects G onto the orthogonal group and is the core "Muon" operation.
+    This projects G onto the orthogonal group (closest orthogonal matrix).
     """
-    assert len(G.shape) == 2
+    if G.ndim != 2:
+        raise ValueError(f"zeropower_via_newtonschulz5 expects a 2D tensor, got shape={tuple(G.shape)}")
+    
     a, b, c = (3.4445, -4.7750, 2.0315)
-    
-    # Run in bfloat16 for speed on CUDA if available, else float32
-    compute_dtype = torch.bfloat16 if G.device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+    compute_dtype = torch.bfloat16 if G.device.type == "cuda" else torch.float32
     X = G.to(dtype=compute_dtype)
+    X /= (X.norm() + eps)
     
-    # Ensure spectral norm < sqrt(3.4445) for convergence
-    X /= (X.norm() + eps) 
-    
+    transposed = False
     if G.size(0) > G.size(1):
         X = X.T
+        transposed = True
         
     for _ in range(steps):
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
         
-    if G.size(0) > G.size(1):
+    if transposed:
         X = X.T
         
-    return X.to(G.dtype)
-
+    return X.to(dtype=G.dtype)
 
 class M3Optimizer(torch.optim.Optimizer):
     """
     True Multi-scale Momentum Muon (M3) Implementation.
-    
-    Logic:
-    1. 2D Parameters (Linear layers): Updated via Momentum + Newton-Schulz Orthogonalization.
-    2. 1D Parameters (Bias, Norm, Embeddings): Updated via standard SGD + Momentum.
     """
     def __init__(
         self,
         params,
-        lr: float = 0.02, # Muon typically needs higher LR than Adam
+        lr: float = 0.02, 
         momentum: float = 0.95,
         beta_slow: float = 0.99,
         slow_freq: int = 50,
@@ -1091,7 +986,6 @@ class M3Optimizer(torch.optim.Optimizer):
                     continue
                 
                 # --- 1. Vector/Embedding Logic (Standard SGD+Momentum) ---
-                # Muon only applies to 2D matrices.
                 if p.ndim != 2:
                     g = p.grad
                     state = self.state[p]
@@ -1111,7 +1005,7 @@ class M3Optimizer(torch.optim.Optimizer):
                         
                     p.data.add_(update, alpha=-lr)
                     continue
- 
+
                 # --- 2. Matrix Logic (The Muon Core) ---
                 state = self.state[p]
                 if len(state) == 0:
@@ -1135,14 +1029,12 @@ class M3Optimizer(torch.optim.Optimizer):
                     state["slow_memory"].mul_(beta_slow).add_(buf, alpha=1 - beta_slow)
 
                 # C. Combine Fast + Slow
-                # If we have passed the first interval, mix in slow memory
                 if state["step"] > slow_freq:
                     combined_update = update_g + slow_weight * state["slow_memory"]
                 else:
                     combined_update = update_g
- 
-                # D. Orthogonalization (Newton-Schulz) 
-                # Projects the update matrix to have uniform spectral energy
+
+                # D. Orthogonalization (Newton-Schulz)
                 orthogonal_update = zeropower_via_newtonschulz5(combined_update, steps=ns_steps)
 
                 # E. Apply Update
@@ -1164,6 +1056,7 @@ def get_param_groups(model: Onyx, weight_decay: float = 0.1, memory_lr_scale: fl
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        # Check for dynamic projection layers
         if any(k in name for k in ("eta_raw", "alpha_raw", "eta_proj", "alpha_proj")):
             memory_params.append(param)
         elif "bias" in name or "norm" in name or "embed" in name:
