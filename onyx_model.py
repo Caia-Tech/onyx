@@ -989,26 +989,64 @@ class Onyx(nn.Module):
 # M3 Optimizer + helpers
 # =============================================================================
 
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Newton-Schulz iteration to compute the zeroth power of matrix G.
+    This projects G onto the orthogonal group and is the core "Muon" operation.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    
+    # Run in bfloat16 for speed on CUDA if available, else float32
+    compute_dtype = torch.bfloat16 if G.device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+    X = G.to(dtype=compute_dtype)
+    
+    # Ensure spectral norm < sqrt(3.4445) for convergence
+    X /= (X.norm() + eps) 
+    
+    if G.size(0) > G.size(1):
+        X = X.T
+        
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+        
+    if G.size(0) > G.size(1):
+        X = X.T
+        
+    return X.to(G.dtype)
+
+
 class M3Optimizer(torch.optim.Optimizer):
+    """
+    True Multi-scale Momentum Muon (M3) Implementation.
+    
+    Logic:
+    1. 2D Parameters (Linear layers): Updated via Momentum + Newton-Schulz Orthogonalization.
+    2. 1D Parameters (Bias, Norm, Embeddings): Updated via standard SGD + Momentum.
+    """
     def __init__(
         self,
         params,
-        lr: float = 1e-4,
-        betas: Tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-8,
-        weight_decay: float = 0.01,
+        lr: float = 0.02, # Muon typically needs higher LR than Adam
+        momentum: float = 0.95,
         beta_slow: float = 0.99,
         slow_freq: int = 50,
         slow_weight: float = 0.1,
+        ns_steps: int = 5,
+        weight_decay: float = 0.01,
+        use_nesterov: bool = True
     ):
         defaults = dict(
             lr=lr,
-            betas=betas,
-            eps=eps,
-            weight_decay=weight_decay,
+            momentum=momentum,
             beta_slow=beta_slow,
             slow_freq=slow_freq,
             slow_weight=slow_weight,
+            ns_steps=ns_steps,
+            weight_decay=weight_decay,
+            use_nesterov=use_nesterov
         )
         super().__init__(params, defaults)
 
@@ -1020,47 +1058,80 @@ class M3Optimizer(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            beta1, beta2 = group["betas"]
+            lr = group["lr"]
+            momentum = group["momentum"]
             beta_slow = group["beta_slow"]
             slow_freq = group["slow_freq"]
             slow_weight = group["slow_weight"]
+            ns_steps = group["ns_steps"]
+            wd = group["weight_decay"]
+            use_nesterov = group["use_nesterov"]
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
+                
+                # --- 1. Vector/Embedding Logic (Standard SGD+Momentum) ---
+                # Muon only applies to 2D matrices.
+                if p.ndim != 2:
+                    g = p.grad
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                    
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    
+                    if use_nesterov:
+                        update = g + momentum * buf
+                    else:
+                        update = buf
+                        
+                    if wd != 0:
+                        p.data.mul_(1 - lr * wd)
+                        
+                    p.data.add_(update, alpha=-lr)
+                    continue
+ 
+                # --- 2. Matrix Logic (The Muon Core) ---
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["fast_momentum"] = torch.zeros_like(p)
+                    state["slow_memory"] = torch.zeros_like(p)
+
                 g = p.grad
-                if g.is_sparse:
-                    raise RuntimeError("M3 does not support sparse gradients")
+                state["step"] += 1
+                
+                # A. Update Fast Momentum
+                buf = state["fast_momentum"]
+                buf.mul_(momentum).add_(g)
+                
+                # Nesterov lookahead for the update direction
+                update_g = (g + momentum * buf) if use_nesterov else buf
 
-                st = self.state[p]
-                if len(st) == 0:
-                    st["step"] = 0
-                    st["exp_avg"] = torch.zeros_like(p)
-                    st["exp_avg_sq"] = torch.zeros_like(p)
-                    st["slow_avg"] = torch.zeros_like(p)
+                # B. Update Slow Memory (Frequency Gated)
+                if state["step"] % slow_freq == 0:
+                    # Integrate fast momentum into slow memory
+                    state["slow_memory"].mul_(beta_slow).add_(buf, alpha=1 - beta_slow)
 
-                st["step"] += 1
-                exp_avg = st["exp_avg"]
-                exp_avg_sq = st["exp_avg_sq"]
-                slow_avg = st["slow_avg"]
+                # C. Combine Fast + Slow
+                # If we have passed the first interval, mix in slow memory
+                if state["step"] > slow_freq:
+                    combined_update = update_g + slow_weight * state["slow_memory"]
+                else:
+                    combined_update = update_g
+ 
+                # D. Orthogonalization (Newton-Schulz) 
+                # Projects the update matrix to have uniform spectral energy
+                orthogonal_update = zeropower_via_newtonschulz5(combined_update, steps=ns_steps)
 
-                if group["weight_decay"] != 0:
-                    p.data.mul_(1 - group["lr"] * group["weight_decay"])
-
-                exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
-
-                bc1 = 1 - beta1 ** st["step"]
-                bc2 = 1 - beta2 ** st["step"]
-
-                step_size = group["lr"] / bc1
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bc2)).add_(group["eps"])
-
-                if st["step"] % slow_freq == 0:
-                    slow_avg.mul_(beta_slow).add_(exp_avg, alpha=1 - beta_slow)
-
-                combined = exp_avg + slow_weight * slow_avg
-                p.data.addcdiv_(combined, denom, value=-step_size)
+                # E. Apply Update
+                if wd != 0:
+                    p.data.mul_(1 - lr * wd)
+                
+                # Apply the orthogonalized update
+                p.data.add_(orthogonal_update, alpha=-lr)
 
         return loss
 
