@@ -52,6 +52,55 @@ except ImportError:
 # Configuration
 # =============================================================================
 
+class CMSFrequencyManager:
+    """
+    Manages the multi-timescale updates for CMS layers.
+    Paper Section 7.1, Eq 71.
+
+    This masks gradients for CMS levels that are not scheduled to update at the
+    current optimizer step.
+    """
+
+    def __init__(self, model: nn.Module, config: OnyxConfig):
+        self.param_schedules: List[Dict[str, Any]] = []
+        if config is None:
+            return
+
+        base = int(getattr(config, "cms_base_chunk", 1) or 1)
+        mult = int(getattr(config, "cms_chunk_multiplier", 2) or 2)
+        if base < 1:
+            base = 1
+        if mult < 1:
+            mult = 1
+
+        for name, param in model.named_parameters():
+            if "ffn.level_ffns" not in name:
+                continue
+            parts = name.split(".")
+            try:
+                idx = parts.index("level_ffns") + 1
+                level = int(parts[idx])
+            except Exception:
+                continue
+
+            update_every = int(base * (mult ** level))
+            update_every = max(1, update_every)
+            self.param_schedules.append(
+                {"param": param, "update_every": update_every, "name": name, "level": level}
+            )
+
+    def mask_gradients(self, global_step: int) -> None:
+        """
+        Call this before gradient clipping / optimizer.step().
+        Zeroes out gradients for levels that shouldn't update this step.
+        """
+        step = int(global_step)
+        for item in self.param_schedules:
+            if step % item["update_every"] != 0:
+                if item["param"].grad is not None:
+                    item["param"].grad = None
+
+
 @dataclass
 class TrainingConfig:
     # === Data ===
@@ -723,6 +772,15 @@ class Trainer:
 
         if total_tokens == 0:
             return None, memory_states
+
+        if not hasattr(self, "_cms_manager"):
+            self._cms_manager = None
+            model_cfg = getattr(self.model, "config", None)
+            if model_cfg is not None and getattr(model_cfg, "use_cms_ffn", False):
+                self._cms_manager = CMSFrequencyManager(self.model, model_cfg)
+
+        if self._cms_manager is not None:
+            self._cms_manager.mask_gradients(self.global_step)
 
         if cfg.gradient_clip > 0:
             if self.scaler is not None:

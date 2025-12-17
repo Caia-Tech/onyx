@@ -204,6 +204,20 @@ class ChunkedLinearDeltaMemory(nn.Module):
         else:
             self.register_buffer("alpha_raw", torch.tensor(inv_sig(config.memory_decay_init)))
 
+        # Dynamic, input-dependent memory hyperparameters (paper Eq. 94 & 95).
+        # We keep eta_raw/alpha_raw as base logits for backward compatibility
+        # with existing checkpoints, and learn input-conditioned deltas via
+        # projections.
+        self.eta_proj = nn.Linear(d_in, 1, bias=True)
+        self.alpha_proj = nn.Linear(d_in, 1, bias=True)
+        nn.init.zeros_(self.eta_proj.weight)
+        nn.init.zeros_(self.eta_proj.bias)
+        nn.init.zeros_(self.alpha_proj.weight)
+        nn.init.zeros_(self.alpha_proj.bias)
+
+        # Backward compatibility: older checkpoints won't have eta_proj/alpha_proj.
+        self.register_load_state_dict_post_hook(self._ignore_missing_dynamic_hyperparams)
+
         self.register_buffer("inference_eta", torch.tensor(config.inference_memory_lr))
         self.register_buffer("inference_alpha", torch.tensor(config.inference_memory_decay))
 
@@ -226,6 +240,48 @@ class ChunkedLinearDeltaMemory(nn.Module):
 
     def get_alpha(self, inference_mode: bool = False) -> Tensor:
         return self.inference_alpha if inference_mode else self.alpha
+
+    def _compute_chunk_hyperparams(self, chunk: Tensor, inference_mode: bool) -> Tuple[Tensor, Tensor]:
+        """
+        Returns (eta, alpha) as chunk-wise tensors shaped [B,1,1].
+
+        Uses input-conditioned projections (self-referential), with different
+        base rates for training vs inference.
+        """
+        B = chunk.size(0)
+        eps = 1e-6
+
+        def _inv_sigmoid01(p: Tensor) -> Tensor:
+            p = p.clamp(min=eps, max=1.0 - eps)
+            return torch.log(p / (1.0 - p))
+
+        if inference_mode:
+            # In inference_mode, default to the configured inference values when
+            # projections are zero, but allow input-dependent modulation.
+            base_eta = self.inference_eta.to(device=chunk.device, dtype=chunk.dtype)  # in [0, max_lr]
+            base_eta01 = (base_eta / float(self.config.max_memory_lr)).clamp(min=eps, max=1.0 - eps)
+            eta_base_logit = _inv_sigmoid01(base_eta01)
+
+            min_d = float(self.config.min_memory_decay)
+            base_alpha = self.inference_alpha.to(device=chunk.device, dtype=chunk.dtype)  # in [0,1]
+            base_alpha01 = ((base_alpha - min_d) / (1.0 - min_d)).clamp(min=eps, max=1.0 - eps)
+            alpha_base_logit = _inv_sigmoid01(base_alpha01)
+        else:
+            eta_base_logit = self.eta_raw.to(device=chunk.device, dtype=chunk.dtype)
+            alpha_base_logit = self.alpha_raw.to(device=chunk.device, dtype=chunk.dtype)
+
+        # raw logits per token: [B,C,1]
+        eta_raw = eta_base_logit + self.eta_proj(chunk)
+        alpha_raw = alpha_base_logit + self.alpha_proj(chunk)
+
+        eta_tok = torch.sigmoid(eta_raw) * self.config.max_memory_lr
+        min_d = self.config.min_memory_decay
+        alpha_tok = min_d + torch.sigmoid(alpha_raw) * (1 - min_d)
+
+        # chunk-wise averages: [B,1,1]
+        eta = eta_tok.mean(dim=1, keepdim=True)
+        alpha = alpha_tok.mean(dim=1, keepdim=True)
+        return eta, alpha
 
     def init_state(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
         return self.M_init.unsqueeze(0).expand(batch_size, -1, -1).clone().to(device=device, dtype=dtype)
@@ -283,16 +339,28 @@ class ChunkedLinearDeltaMemory(nn.Module):
         if M is None or M.size(0) != B:
             M = self.init_state(B, x.device, x.dtype)
 
-        eta = self.get_eta(inference_mode)
-        alpha = self.get_alpha(inference_mode)
-
         outs = []
         for start in range(0, S, self.chunk_size):
             end = min(start + self.chunk_size, S)
             chunk = x[:, start:end, :]
+            eta, alpha = self._compute_chunk_hyperparams(chunk, inference_mode)
             chunk_out, M = self._process_chunk(M, chunk, eta, alpha, update_memory)
             outs.append(chunk_out)
         return torch.cat(outs, dim=1), M
+
+    @staticmethod
+    def _ignore_missing_dynamic_hyperparams(module, incompatible_keys) -> None:
+        del module
+        missing = incompatible_keys.missing_keys
+        suffixes = (
+            "eta_proj.weight",
+            "eta_proj.bias",
+            "alpha_proj.weight",
+            "alpha_proj.bias",
+        )
+        for i in range(len(missing) - 1, -1, -1):
+            if missing[i].endswith(suffixes):
+                missing.pop(i)
 
     def get_memory_reg_loss(self, M: Tensor) -> Tensor:
         return M.pow(2).mean()
@@ -1006,7 +1074,7 @@ def get_param_groups(model: Onyx, weight_decay: float = 0.1, memory_lr_scale: fl
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "eta_raw" in name or "alpha_raw" in name:
+        if any(k in name for k in ("eta_raw", "alpha_raw", "eta_proj", "alpha_proj")):
             memory_params.append(param)
         elif "bias" in name or "norm" in name or "embed" in name:
             no_decay_params.append(param)
