@@ -43,3 +43,14 @@ def test_sample_token_repetition_penalty_changes_argmax_under_temperature_zero()
         generated_tokens=generated,
     )
     assert int(tok.item()) == 1
+
+
+def test_sample_token_accepts_python_set_for_repetition_penalty():
+    logits = torch.tensor([[1.0, 0.99, -5.0]], dtype=torch.float32)
+    tok = sample_token(
+        logits.clone(),
+        temperature=0.0,
+        repetition_penalty=2.0,
+        generated_tokens={0},
+    )
+    assert int(tok.item()) == 1

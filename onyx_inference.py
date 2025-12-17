@@ -158,15 +158,33 @@ def sample_token(
     top_p: float = 0.9,
     min_p: float = 0.0,
     repetition_penalty: float = 1.0,
-    generated_tokens: Optional[torch.Tensor] = None,
+    generated_tokens: Optional[object] = None,
 ) -> torch.Tensor:
-    if repetition_penalty != 1.0 and generated_tokens is not None and generated_tokens.numel() > 0:
-        for tid in generated_tokens.unique():
-            tid = int(tid.item())
-            if logits[0, tid] > 0:
-                logits[0, tid] /= repetition_penalty
-            else:
-                logits[0, tid] *= repetition_penalty
+    def _iter_penalty_token_ids(src: object):
+        if src is None:
+            return ()
+        if isinstance(src, set):
+            return src
+        if isinstance(src, (list, tuple)):
+            return src
+        if torch.is_tensor(src):
+            if src.numel() == 0:
+                return ()
+            t = src.detach()
+            # MPS unique can be slow; always compute on CPU.
+            if t.device.type != "cpu":
+                t = t.to("cpu")
+            return [int(x) for x in torch.unique(t)]
+        return ()
+
+    if repetition_penalty != 1.0:
+        for tid in _iter_penalty_token_ids(generated_tokens):
+            tid = int(tid)
+            if 0 <= tid < logits.size(-1):
+                if logits[0, tid] > 0:
+                    logits[0, tid] /= repetition_penalty
+                else:
+                    logits[0, tid] *= repetition_penalty
 
     if temperature <= 0:
         return torch.argmax(logits, dim=-1, keepdim=True)
@@ -235,7 +253,8 @@ def generate_stream(
     if stop_on_eos and eos_token_id is not None and eos_token_id not in stop_tokens:
         stop_tokens.append(eos_token_id)
 
-    generated_tokens = torch.empty((0,), dtype=torch.long, device=device)
+    generated_count = 0
+    seen_token_ids: set[int] = set()
 
     with torch.no_grad():
         outputs = model(
@@ -253,7 +272,7 @@ def generate_stream(
         with torch.no_grad():
             logits = outputs["logits"][:, -1, :]  # [1, vocab]
 
-            if eos_token_id is not None and generated_tokens.numel() < min_tokens_before_eos:
+            if eos_token_id is not None and generated_count < min_tokens_before_eos:
                 logits[:, eos_token_id] = float("-inf")
 
             next_token = sample_token(
@@ -263,11 +282,13 @@ def generate_stream(
                 top_p=top_p,
                 min_p=min_p,
                 repetition_penalty=repetition_penalty,
-                generated_tokens=generated_tokens,
+                generated_tokens=(seen_token_ids if repetition_penalty != 1.0 else None),
             )  # [1,1]
 
             tid = int(next_token.item())
-            generated_tokens = torch.cat([generated_tokens, next_token.view(-1)], dim=0)
+            generated_count += 1
+            if repetition_penalty != 1.0:
+                seen_token_ids.add(tid)
 
             # Consume the token to advance memory + kv_cache first
             next_outputs = model(
@@ -410,57 +431,60 @@ def chat(
         generated_text = ""
         token_count = 0
 
-        if stream:
-            for token, memory_states in generate_stream(
-                model=model,
-                input_ids=input_ids,
-                tokenizer=tokenizer,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                memory_states=memory_states,
-                update_memory=update_memory,
-                eos_token_id=eos_token_id,
-                stop_tokens=stop_tokens,
-                min_tokens_before_eos=8,
-                stop_on_eos=True,
-            ):
-                tid = int(token.item())
-                if eos_token_id is not None and tid == eos_token_id:
-                    continue
-                txt = tokenizer.decode(token[0], skip_special_tokens=True)
-                print(txt, end="", flush=True)
-                generated_text += txt
-                token_count += 1
-        else:
-            # Non-stream: do a quick greedy-style loop via generate_stream accumulation
-            for token, memory_states in generate_stream(
-                model=model,
-                input_ids=input_ids,
-                tokenizer=tokenizer,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                memory_states=memory_states,
-                update_memory=update_memory,
-                eos_token_id=eos_token_id,
-                stop_tokens=stop_tokens,
-                min_tokens_before_eos=8,
-                stop_on_eos=True,
-            ):
-                tid = int(token.item())
-                if eos_token_id is not None and tid == eos_token_id:
-                    continue
-                txt = tokenizer.decode(token[0], skip_special_tokens=True)
-                generated_text += txt
-                token_count += 1
-            print(generated_text, end="", flush=True)
+        try:
+            if stream:
+                for token, memory_states in generate_stream(
+                    model=model,
+                    input_ids=input_ids,
+                    tokenizer=tokenizer,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    memory_states=memory_states,
+                    update_memory=update_memory,
+                    eos_token_id=eos_token_id,
+                    stop_tokens=stop_tokens,
+                    min_tokens_before_eos=8,
+                    stop_on_eos=True,
+                ):
+                    tid = int(token.item())
+                    if eos_token_id is not None and tid == eos_token_id:
+                        continue
+                    txt = tokenizer.decode(token[0], skip_special_tokens=True)
+                    print(txt, end="", flush=True)
+                    generated_text += txt
+                    token_count += 1
+            else:
+                # Non-stream: do a quick greedy-style loop via generate_stream accumulation
+                for token, memory_states in generate_stream(
+                    model=model,
+                    input_ids=input_ids,
+                    tokenizer=tokenizer,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    memory_states=memory_states,
+                    update_memory=update_memory,
+                    eos_token_id=eos_token_id,
+                    stop_tokens=stop_tokens,
+                    min_tokens_before_eos=8,
+                    stop_on_eos=True,
+                ):
+                    tid = int(token.item())
+                    if eos_token_id is not None and tid == eos_token_id:
+                        continue
+                    txt = tokenizer.decode(token[0], skip_special_tokens=True)
+                    generated_text += txt
+                    token_count += 1
+                print(generated_text, end="", flush=True)
+        except KeyboardInterrupt:
+            print("\n[Interrupted generation]\n", flush=True)
 
         elapsed = time.time() - start
         print(f"\n\033[90m[{token_count} tokens, {token_count / max(elapsed, 1e-8):.1f} tok/s]\033[0m\n")
