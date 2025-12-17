@@ -99,7 +99,8 @@ def test_inference_main_prompt_path_offline(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(onyx_inference, "AutoTokenizer", _AT, raising=False)
 
-    def _load_model(_ckpt, _tokenizer, device, dtype, _model_config):
+    def _load_model(_ckpt, _tokenizer, device, dtype, model_config_path=None):
+        _ = model_config_path
         _ = (_ckpt, _tokenizer)
         return model.to(device=device, dtype=dtype), None
 

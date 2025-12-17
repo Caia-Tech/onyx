@@ -64,3 +64,6 @@ memory_states/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Local helpers
+commands.txt
