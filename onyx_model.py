@@ -11,7 +11,7 @@ Notes:
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Callable
 from pathlib import Path
 
 import torch
@@ -296,6 +296,7 @@ class ChunkedLinearDeltaMemory(nn.Module):
         eta: Tensor,
         alpha: Tensor,
         update_memory: bool,
+        target_generator: Optional[Callable[[Tensor], Tensor]] = None,
     ) -> Tuple[Tensor, Tensor]:
         # chunk: [B, C, d_in]
         outputs = self.retrieve_batch(M, chunk)
@@ -305,14 +306,20 @@ class ChunkedLinearDeltaMemory(nn.Module):
         keys = normalize_for_delta(chunk, dim=-1, eps=self.config.norm_eps) if self.config.normalize_keys else chunk
 
         k_mean = keys.mean(dim=1)      # [B, d_in]
-        v_mean = outputs.mean(dim=1)   # [B, d_out]
+        # Self-generated targets (Hope): allow the model to decide what value it
+        # "wished" it had retrieved, then learn that mapping via the delta rule.
+        if target_generator is not None:
+            targets = target_generator(outputs)
+            v_target = targets.mean(dim=1)  # [B, d_out]
+        else:
+            v_target = outputs.mean(dim=1)  # [B, d_out]
 
         if self.config.use_delta_rule:
             Mk = torch.bmm(M, k_mean.unsqueeze(-1)).squeeze(-1)  # [B, d_out]
-            error = v_mean - Mk
+            error = v_target - Mk
             update = torch.bmm(error.unsqueeze(-1), k_mean.unsqueeze(1))  # [B, d_out, d_in]
         else:
-            update = torch.bmm(v_mean.unsqueeze(-1), k_mean.unsqueeze(1))
+            update = torch.bmm(v_target.unsqueeze(-1), k_mean.unsqueeze(1))
 
         C = chunk.size(1)
         chunk_scale = min(C / float(self.chunk_size), 1.0)
@@ -334,6 +341,7 @@ class ChunkedLinearDeltaMemory(nn.Module):
         M: Optional[Tensor] = None,
         inference_mode: bool = False,
         update_memory: bool = True,
+        target_generator: Optional[Callable[[Tensor], Tensor]] = None,
     ) -> Tuple[Tensor, Tensor]:
         B, S, _ = x.shape
         if M is None or M.size(0) != B:
@@ -344,7 +352,7 @@ class ChunkedLinearDeltaMemory(nn.Module):
             end = min(start + self.chunk_size, S)
             chunk = x[:, start:end, :]
             eta, alpha = self._compute_chunk_hyperparams(chunk, inference_mode)
-            chunk_out, M = self._process_chunk(M, chunk, eta, alpha, update_memory)
+            chunk_out, M = self._process_chunk(M, chunk, eta, alpha, update_memory, target_generator)
             outs.append(chunk_out)
         return torch.cat(outs, dim=1), M
 
@@ -393,12 +401,23 @@ class ChunkedSelfReferentialMemory(nn.Module):
         inference_mode: bool = False,
         update_memory: bool = True,
     ) -> Tuple[Tensor, Tensor]:
-        outputs, M_new = self.memory(x, M, inference_mode, update_memory)
-        if self.value_gen is not None:
-            base_v = value_input if value_input is not None else outputs
-            v_hat = self.value_gen(base_v) + base_v
-            return v_hat, M_new
-        return outputs, M_new
+        def target_gen_fn(retrieved_vals: Tensor) -> Tensor:
+            # Eq 84/87: v_hat = ValueGen(v_t) + v_t
+            if self.value_gen is not None:
+                base = value_input if value_input is not None else retrieved_vals
+                return self.value_gen(base) + base
+            return retrieved_vals
+
+        outputs, M_new = self.memory(
+            x,
+            M,
+            inference_mode=inference_mode,
+            update_memory=update_memory,
+            target_generator=target_gen_fn,
+        )
+
+        final_out = target_gen_fn(outputs)
+        return final_out, M_new
 
     def get_memory_reg_loss(self, M: Tensor) -> Tensor:
         return self.memory.get_memory_reg_loss(M)
