@@ -31,10 +31,17 @@ def _supports_color() -> bool:
     return bool(getattr(sys.stdout, "isatty", lambda: False)())
 
 
-def _cyan(text: str) -> str:
+def _onyx_blue(text: str) -> str:
     if not _supports_color():
         return text
-    return f"\033[36m{text}\033[0m"
+    # Lighter/brighter sky-blue (256-color). Works well on both dark/light themes.
+    return f"\033[1;38;5;81m{text}\033[0m"
+
+
+def _dim(text: str) -> str:
+    if not _supports_color():
+        return text
+    return f"\033[2m{text}\033[0m"
 
 
 def _strip_leading_assistant(text: str) -> str:
@@ -202,9 +209,13 @@ def _decode_incremental(tokenizer, token_ids: List[int], printed_len: int) -> tu
 
 
 def chat(model: Onyx, tokenizer, device: torch.device, dtype: torch.dtype, memory_mode: str = "session", memory_path: Optional[str] = None, learning: bool = False, temperature: float = 0.8, top_k: int = 50, top_p: float = 0.9, min_p: float = 0.0, repetition_penalty: float = 1.1, max_tokens: int = 512, stream: bool = True, system_prompt: Optional[str] = None):
-    onyx_tag = _cyan("onyx")
-    print(f"\n=== {onyx_tag} chat (memory: {memory_mode}) ===")
-    print("commands: /save /clear /exit")
+    onyx_tag = _onyx_blue("onyx")
+    device_str = getattr(device, "type", str(device))
+    dtype_str = str(dtype).replace("torch.", "")
+    print(f"\n{_dim('═' * 72)}")
+    print(f" {onyx_tag}  {_dim('|')}  device: {device_str}  {_dim('|')}  dtype: {dtype_str}  {_dim('|')}  memory: {memory_mode}")
+    print(f" {_dim('commands:')} /save  /clear  /exit")
+    print(f"{_dim('═' * 72)}")
     memory_states = None
     if memory_mode == "persistent" and memory_path and Path(memory_path).exists():
         try:
@@ -220,7 +231,7 @@ def chat(model: Onyx, tokenizer, device: torch.device, dtype: torch.dtype, memor
     max_stop_len = max((len(s) for s in stop_seqs), default=0)
     while True:
         try:
-            user_input = input("\nyou> ").strip()
+            user_input = input(f"\n{_dim('you:')} ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting.")
             break
@@ -246,7 +257,7 @@ def chat(model: Onyx, tokenizer, device: torch.device, dtype: torch.dtype, memor
         prompt += f"User: {user_input}\nAssistant: "
         input_ids = tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=False).to(device)
         update_memory = (memory_mode != "stateless")
-        print(f"{onyx_tag}> ", end="", flush=True)
+        print(f"{onyx_tag}{_dim(':')} ", end="", flush=True)
         generated_text = ""
         out_token_ids: List[int] = []
         printed_len = 0
@@ -311,12 +322,12 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     model, _ = load_model(args.checkpoint, tokenizer, device=device, dtype=dtype, model_config_path=args.model_config)
     if args.prompt:
-        onyx_tag = _cyan("onyx")
+        onyx_tag = _onyx_blue("onyx")
         prompt = args.prompt
         input_ids = tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=False).to(device)
 
-        print(f"prompt> {prompt}")
-        print(f"{onyx_tag}> ", end="", flush=True)
+        print(f"{_dim('prompt:')} {prompt}")
+        print(f"{onyx_tag}{_dim(':')} ", end="", flush=True)
 
         eos = tokenizer.eos_token_id
         stop_tokens = [eos] if eos is not None else []
