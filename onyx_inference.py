@@ -9,6 +9,7 @@ import json
 import time
 import sys
 import dataclasses
+import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Generator, Tuple
 import torch
@@ -21,6 +22,24 @@ except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
 from onyx_model import Onyx, OnyxConfig
+
+_TURN_MARKERS = ("\nUser:", "\nAssistant:", "\nSystem:")
+_LEADING_ASSISTANT_RE = re.compile(r"^\s*(assistant\s*:+\s*)+", flags=re.IGNORECASE)
+
+
+def _supports_color() -> bool:
+    return bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+
+def _cyan(text: str) -> str:
+    if not _supports_color():
+        return text
+    return f"\033[36m{text}\033[0m"
+
+
+def _strip_leading_assistant(text: str) -> str:
+    return _LEADING_ASSISTANT_RE.sub("", text)
+
 
 def _flatten_cfg(cfg_json: dict) -> dict:
     flat = {}
@@ -165,20 +184,43 @@ def generate_stream(model: Onyx, input_ids: torch.Tensor, tokenizer, max_new_tok
             outputs = next_outputs
             if tid in stop_tokens: break
 
+def _stop_seqs(tokenizer) -> List[List[int]]:
+    seqs: List[List[int]] = []
+    for m in _TURN_MARKERS:
+        ids = tokenizer.encode(m, add_special_tokens=False)
+        if ids:
+            seqs.append(ids)
+    return seqs
+
+
+def _decode_incremental(tokenizer, token_ids: List[int], printed_len: int) -> tuple[str, int]:
+    text = tokenizer.decode(token_ids, skip_special_tokens=True)
+    text = _strip_leading_assistant(text).lstrip("\n ")
+    if len(text) <= printed_len:
+        return "", printed_len
+    return text[printed_len:], len(text)
+
+
 def chat(model: Onyx, tokenizer, device: torch.device, dtype: torch.dtype, memory_mode: str = "session", memory_path: Optional[str] = None, learning: bool = False, temperature: float = 0.8, top_k: int = 50, top_p: float = 0.9, min_p: float = 0.0, repetition_penalty: float = 1.1, max_tokens: int = 512, stream: bool = True, system_prompt: Optional[str] = None):
-    print(f"\n=== Onyx Chat (Memory: {memory_mode}) ===")
-    print("Commands: /save, /clear, /exit")
+    onyx_tag = _cyan("onyx")
+    print(f"\n=== {onyx_tag} chat (memory: {memory_mode}) ===")
+    print("commands: /save /clear /exit")
     memory_states = None
     if memory_mode == "persistent" and memory_path and Path(memory_path).exists():
         try:
             memory_states = model.load_memory_states(memory_path, device, dtype)
-            print(f"[System] Loaded persistent memory from {memory_path}")
-        except Exception as e: print(f"[Error] Could not load memory: {e}")
+            print(f"system> loaded persistent memory from {memory_path}")
+        except Exception as e:
+            print(f"error> could not load memory: {e}")
     eos = tokenizer.eos_token_id
     stop_tokens = [eos] if eos is not None else []
-    conversation_history = []
+    conversation_history: List[str] = []
+    max_history_turns = 8
+    stop_seqs = _stop_seqs(tokenizer)
+    max_stop_len = max((len(s) for s in stop_seqs), default=0)
     while True:
-        try: user_input = input("\nYou: ").strip()
+        try:
+            user_input = input("\nyou> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting.")
             break
@@ -187,30 +229,51 @@ def chat(model: Onyx, tokenizer, device: torch.device, dtype: torch.dtype, memor
         if user_input.lower() == "/clear":
             memory_states = None
             conversation_history = []
-            print("[System] Memory cleared.")
+            print("system> memory cleared")
             continue
         if user_input.lower() == "/save":
             if memory_path and memory_states:
                 model.save_memory_states(memory_states, memory_path)
-                print(f"[System] Memory saved to {memory_path}")
-            else: print("[System] No memory path or empty memory.")
+                print(f"system> memory saved to {memory_path}")
+            else:
+                print("system> no memory path or empty memory")
             continue
         prompt = ""
-        if system_prompt: prompt += f"System: {system_prompt}\n\n"
-        prompt += f"User: {user_input}\nAssistant:"
+        if system_prompt:
+            prompt += f"System: {system_prompt}\n\n"
+        if conversation_history:
+            prompt += "\n\n".join(conversation_history[-max_history_turns:]).rstrip() + "\n\n"
+        prompt += f"User: {user_input}\nAssistant: "
         input_ids = tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=False).to(device)
         update_memory = (memory_mode != "stateless")
-        print("Onyx: ", end="", flush=True)
+        print(f"{onyx_tag}> ", end="", flush=True)
         generated_text = ""
+        out_token_ids: List[int] = []
+        printed_len = 0
         gen_gen = generate_stream(model=model, input_ids=input_ids, tokenizer=tokenizer, max_new_tokens=max_tokens, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, repetition_penalty=repetition_penalty, memory_states=memory_states, update_memory=update_memory, eos_token_id=eos, stop_tokens=stop_tokens)
         for token, new_mem_state in gen_gen:
             tid = int(token.item())
             if tid == eos: break
-            word = tokenizer.decode([tid], skip_special_tokens=True)
-            print(word, end="", flush=True)
-            generated_text += word
+            out_token_ids.append(tid)
+
+            # Stop if the model starts emitting a new turn marker; drop the marker from output.
+            stop_now = False
+            if max_stop_len and len(out_token_ids) >= 1:
+                for seq in stop_seqs:
+                    if len(seq) <= len(out_token_ids) and out_token_ids[-len(seq) :] == seq:
+                        del out_token_ids[-len(seq) :]
+                        stop_now = True
+                        break
+
+            delta, printed_len = _decode_incremental(tokenizer, out_token_ids, printed_len)
+            if delta:
+                print(delta, end="", flush=True)
+                generated_text += delta
+
             memory_states = new_mem_state
-        print("") 
+            if stop_now:
+                break
+        print("")
         conversation_history.append(f"User: {user_input}\nAssistant: {generated_text}")
         if learning and memory_mode == "persistent" and memory_path:
             model.save_memory_states(memory_states, memory_path)
@@ -248,18 +311,72 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     model, _ = load_model(args.checkpoint, tokenizer, device=device, dtype=dtype, model_config_path=args.model_config)
     if args.prompt:
-        input_ids = tokenizer.encode(args.prompt, return_tensors="pt").to(device)
-        print(f"Prompt: {args.prompt}")
-        print("Output:", end=" ")
+        onyx_tag = _cyan("onyx")
+        prompt = args.prompt
+        input_ids = tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=False).to(device)
+
+        print(f"prompt> {prompt}")
+        print(f"{onyx_tag}> ", end="", flush=True)
+
+        eos = tokenizer.eos_token_id
+        stop_tokens = [eos] if eos is not None else []
+        stop_seqs = _stop_seqs(tokenizer)
+        max_stop_len = max((len(s) for s in stop_seqs), default=0)
+
+        out_token_ids: List[int] = []
+        printed_len = 0
+
+        gen = generate_stream(
+            model=model,
+            input_ids=input_ids,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            min_p=args.min_p,
+            repetition_penalty=args.repetition_penalty,
+            eos_token_id=eos,
+            stop_tokens=stop_tokens,
+        )
+
         if args.stream:
-            for token, _ in generate_stream(model, input_ids, tokenizer, max_new_tokens=args.max_tokens, temperature=args.temperature):
-                print(tokenizer.decode(token[0], skip_special_tokens=True), end="", flush=True)
+            for token, _ in gen:
+                tid = int(token.item())
+                if tid == eos:
+                    break
+                out_token_ids.append(tid)
+
+                stop_now = False
+                if max_stop_len:
+                    for seq in stop_seqs:
+                        if len(seq) <= len(out_token_ids) and out_token_ids[-len(seq) :] == seq:
+                            del out_token_ids[-len(seq) :]
+                            stop_now = True
+                            break
+
+                delta, printed_len = _decode_incremental(tokenizer, out_token_ids, printed_len)
+                if delta:
+                    print(delta, end="", flush=True)
+
+                if stop_now:
+                    break
             print()
         else:
-            output_tokens = []
-            for token, _ in generate_stream(model, input_ids, tokenizer, max_new_tokens=args.max_tokens, temperature=args.temperature):
-                output_tokens.append(token.item())
-            print(tokenizer.decode(output_tokens, skip_special_tokens=True))
+            for token, _ in gen:
+                tid = int(token.item())
+                if tid == eos:
+                    break
+                out_token_ids.append(tid)
+
+                if max_stop_len:
+                    for seq in stop_seqs:
+                        if len(seq) <= len(out_token_ids) and out_token_ids[-len(seq) :] == seq:
+                            del out_token_ids[-len(seq) :]
+                            break
+            text = tokenizer.decode(out_token_ids, skip_special_tokens=True)
+            text = _strip_leading_assistant(text).lstrip("\n ")
+            print(text)
     else:
         chat(model, tokenizer, device, dtype, memory_mode=args.memory, memory_path=args.memory_path, learning=args.learning, temperature=args.temperature, max_tokens=args.max_tokens, stream=args.stream, system_prompt=args.system)
 

@@ -16,6 +16,7 @@ import json
 import math
 import os
 import random
+import re
 import signal
 import sys
 import time
@@ -178,7 +179,20 @@ class TrainingConfig:
 # Dataset
 # =============================================================================
 
-def _iter_jsonl_texts(filepath: str) -> Iterator[str]:
+_ROLE_PREFIX_RE = re.compile(r"^\\s*(system|user|assistant)\\s*:\\s*", flags=re.IGNORECASE)
+
+
+def _strip_leading_role_prefixes(text: str) -> str:
+    s = text
+    for _ in range(4):
+        m = _ROLE_PREFIX_RE.match(s)
+        if not m:
+            break
+        s = s[m.end() :]
+    return s.lstrip()
+
+
+def _iter_jsonl_texts(filepath: str) -> Iterator[Union[str, Dict[str, str]]]:
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -197,6 +211,15 @@ def _iter_jsonl_texts(filepath: str) -> Iterator[str]:
                 user = data.get("user")
                 assistant = data.get("assistant")
                 if isinstance(user, str) and isinstance(assistant, str):
+                    # If the record is chat-shaped, yield a structured doc so we can
+                    # mask loss on the prompt and train only on the assistant span.
+                    yield {
+                        "system": system if isinstance(system, str) else "",
+                        "user": user,
+                        "assistant": assistant,
+                    }
+                    continue
+
                     system = system.strip() if isinstance(system, str) else ""
                     user = user.strip()
                     assistant = assistant.strip()
@@ -283,7 +306,50 @@ class StreamingPackedDataset(IterableDataset):
     def _tokenize(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
 
-    def _pack_sequences_with_boundaries(self) -> Iterator[Tuple[List[int], List[int], Optional[int]]]:
+    def _tokenize_doc(self, doc: object) -> Optional[Tuple[List[int], List[int]]]:
+        """
+        Returns (input_ids, labels) for a single document.
+
+        If the doc is chat-shaped (system/user/assistant), mask the prompt span
+        with -100 so loss is computed only on assistant tokens (SFT-style).
+        """
+        # Plain text doc: train on all tokens.
+        if isinstance(doc, str):
+            toks = self._tokenize(doc)
+            if not toks:
+                return None
+            toks.append(self.eod_token_id)
+            return toks, list(toks)
+
+        if isinstance(doc, dict) and ("user" in doc and "assistant" in doc):
+            system = doc.get("system") if isinstance(doc.get("system"), str) else ""
+            user = doc.get("user") if isinstance(doc.get("user"), str) else ""
+            assistant = doc.get("assistant") if isinstance(doc.get("assistant"), str) else ""
+
+            system = _strip_leading_role_prefixes(system.strip())
+            user = _strip_leading_role_prefixes(user.strip())
+            assistant = _strip_leading_role_prefixes(assistant.strip())
+
+            if not user or not assistant:
+                return None
+
+            prompt = ""
+            if system:
+                prompt += f"System: {system}\n\n"
+            prompt += f"User: {user}\nAssistant: "
+
+            prompt_ids = self._tokenize(prompt)
+            assistant_ids = self._tokenize(assistant)
+            if not prompt_ids or not assistant_ids:
+                return None
+
+            toks = prompt_ids + assistant_ids + [self.eod_token_id]
+            labels = ([-100] * len(prompt_ids)) + assistant_ids + [self.eod_token_id]
+            return toks, labels
+
+        return None
+
+    def _pack_sequences_with_boundaries(self) -> Iterator[Tuple[List[int], List[int], List[int], Optional[int]]]:
         """Pack documents into fixed-length sequences and track doc boundaries.
 
         The returned `boundaries` is a cu_seqlens-style list of start offsets for
@@ -291,6 +357,7 @@ class StreamingPackedDataset(IterableDataset):
         starting at 0 and ending at `max_seq_len`.
         """
         current_seq: List[int] = []
+        current_labels: List[int] = []
         current_boundaries: List[int] = [0]  # doc start offsets within current_seq
 
         def _dedup_consecutive(xs: List[int]) -> List[int]:
@@ -303,13 +370,14 @@ class StreamingPackedDataset(IterableDataset):
             return out
 
         for doc in self._iter_documents():
-            toks = self._tokenize(doc)
-            if not toks:
+            tok_pair = self._tokenize_doc(doc)
+            if tok_pair is None:
                 continue
+            toks, labels = tok_pair
 
-            toks.append(self.eod_token_id)
             doc_start_in_seq = len(current_seq)
             current_seq.extend(toks)
+            current_labels.extend(labels)
 
             # Track where the new document begins (if not already at 0)
             if doc_start_in_seq != 0:
@@ -318,6 +386,7 @@ class StreamingPackedDataset(IterableDataset):
 
             while len(current_seq) >= self.max_seq_len:
                 seq = current_seq[: self.max_seq_len]
+                lab = current_labels[: self.max_seq_len]
 
                 b = [v for v in current_boundaries if v < self.max_seq_len]
                 if not b or b[0] != 0:
@@ -326,10 +395,11 @@ class StreamingPackedDataset(IterableDataset):
                     b.append(self.max_seq_len)
                 b = _dedup_consecutive(b)
 
-                yield seq, b, None
+                yield seq, lab, b, None
 
                 # Shift leftovers and boundaries down by max_seq_len.
                 current_seq = current_seq[self.max_seq_len :]
+                current_labels = current_labels[self.max_seq_len :]
                 shifted = [v - self.max_seq_len for v in current_boundaries if v >= self.max_seq_len]
                 if not shifted or shifted[0] != 0:
                     shifted.insert(0, 0)  # doc continuation starts at 0 in the new chunk
@@ -339,7 +409,9 @@ class StreamingPackedDataset(IterableDataset):
             pad_start = None
             if len(current_seq) < self.max_seq_len:
                 pad_start = len(current_seq)
-                current_seq.extend([self.eod_token_id] * (self.max_seq_len - len(current_seq)))
+                pad = self.max_seq_len - len(current_seq)
+                current_seq.extend([self.eod_token_id] * pad)
+                current_labels.extend([-100] * pad)
 
             b = [v for v in current_boundaries if v < self.max_seq_len]
             if not b or b[0] != 0:
@@ -348,35 +420,40 @@ class StreamingPackedDataset(IterableDataset):
                 b.append(self.max_seq_len)
             b = _dedup_consecutive(b)
 
-            yield current_seq[: self.max_seq_len], b, pad_start
+            yield current_seq[: self.max_seq_len], current_labels[: self.max_seq_len], b, pad_start
 
-    def _simple_sequences(self) -> Iterator[Tuple[List[int], Optional[int]]]:
+    def _simple_sequences(self) -> Iterator[Tuple[List[int], List[int], Optional[int]]]:
         buf: List[int] = []
+        buf_labels: List[int] = []
         for doc in self._iter_documents():
-            toks = self._tokenize(doc)
-            if not toks:
+            tok_pair = self._tokenize_doc(doc)
+            if tok_pair is None:
                 continue
-            toks.append(self.eod_token_id)
+            toks, labels = tok_pair
             buf.extend(toks)
+            buf_labels.extend(labels)
 
             while len(buf) >= self.max_seq_len:
-                yield buf[: self.max_seq_len], None
+                yield buf[: self.max_seq_len], buf_labels[: self.max_seq_len], None
                 buf = buf[self.max_seq_len :]
+                buf_labels = buf_labels[self.max_seq_len :]
 
         if buf and not self.drop_remainder:
             pad_start = None
             if len(buf) < self.max_seq_len:
                 pad_start = len(buf)
-                buf.extend([self.eod_token_id] * (self.max_seq_len - len(buf)))
-            yield buf[: self.max_seq_len], pad_start
+                pad = self.max_seq_len - len(buf)
+                buf.extend([self.eod_token_id] * pad)
+                buf_labels.extend([-100] * pad)
+            yield buf[: self.max_seq_len], buf_labels[: self.max_seq_len], pad_start
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         if self.pack:
-            for seq, boundaries, pad_start in self._pack_sequences_with_boundaries():
+            for seq, lab, boundaries, pad_start in self._pack_sequences_with_boundaries():
                 input_ids = torch.tensor(seq, dtype=torch.long)
-                labels = input_ids.clone()
+                labels = torch.tensor(lab, dtype=torch.long)
                 if pad_start is not None and pad_start < labels.numel():
-                    labels[pad_start:] = -100
+                    labels[pad_start:] = -100  # safety
 
                 sample: Dict[str, Any] = {"input_ids": input_ids, "labels": labels}
                 if self.emit_cu_seqlens:
@@ -384,11 +461,11 @@ class StreamingPackedDataset(IterableDataset):
                     sample["max_seqlen"] = self.max_seq_len
                 yield sample
         else:
-            for seq, pad_start in self._simple_sequences():
+            for seq, lab, pad_start in self._simple_sequences():
                 input_ids = torch.tensor(seq, dtype=torch.long)
-                labels = input_ids.clone()
+                labels = torch.tensor(lab, dtype=torch.long)
                 if pad_start is not None:
-                    labels[pad_start:] = -100
+                    labels[pad_start:] = -100  # safety
                 yield {"input_ids": input_ids, "labels": labels}
 
 

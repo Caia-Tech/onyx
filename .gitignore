@@ -67,3 +67,6 @@ memory_states/
 
 # Local helpers
 commands.txt
+
+# Local tokenizers (trained artifacts)
+tokenizers/
