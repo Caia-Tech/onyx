@@ -892,7 +892,16 @@ class Trainer:
         if cfg.max_steps is not None:
             total_steps = int(cfg.max_steps)
         elif cfg.train_tokens_target is not None:
-            total_steps = int(cfg.train_tokens_target // max(1, cfg.tokens_per_step))
+            # IMPORTANT: `tokens_seen` is incremented by the *actual* tokens processed per optimizer step
+            # (= accumulation_steps * batch_size * max_seq_len). If `cfg.tokens_per_step` is smaller
+            # than that (e.g. user sets 256 while batch_size*max_seq_len is 8192), accumulation_steps
+            # clamps to 1 and the true tokens/step becomes the batch tokens, not `cfg.tokens_per_step`.
+            effective_tps = int(getattr(self, 'accumulation_steps', 1)) * int(cfg.batch_size) * int(cfg.max_seq_len)
+            if effective_tps <= 0:
+                effective_tps = max(1, int(cfg.tokens_per_step))
+            if int(cfg.tokens_per_step) < effective_tps:
+                print(f"[WARN] tokens_per_step ({cfg.tokens_per_step}) < effective tokens/step ({effective_tps}); using {effective_tps} for --train_tokens_target scheduling.")
+            total_steps = int(cfg.train_tokens_target // max(1, effective_tps))
         else:
             # If neither is provided, run "epochs" based on a conservative estimate:
             # we approximate steps per epoch by counting batches for one pass.
