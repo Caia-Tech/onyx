@@ -128,6 +128,7 @@ class TrainingConfig:
     min_lr: float = 3e-5
     memory_lr_scale: float = 0.1
     warmup_steps: int = 50
+    warmup_ratio: Optional[float] = None
     weight_decay: float = 0.1
 
     # === Memory ===
@@ -919,9 +920,19 @@ class Trainer:
         if bench_mode:
             total_steps = self.global_step + int(cfg.bench_steps)
 
+        if cfg.warmup_ratio is not None:
+            if cfg.warmup_ratio <= 0.0 or cfg.warmup_ratio >= 1.0:
+                print("[WARN] warmup_ratio must be between 0 and 1; ignoring.")
+            else:
+                cfg.warmup_steps = max(1, int(total_steps * cfg.warmup_ratio))
+                if cfg.warmup_steps >= total_steps:
+                    cfg.warmup_steps = max(1, total_steps - 1)
+
         print("=" * 70)
         print("Starting training")
         print(f"  Total steps: {total_steps:,}")
+        if cfg.warmup_ratio is not None and 0.0 < cfg.warmup_ratio < 1.0:
+            print(f"  Warmup steps: {cfg.warmup_steps} (ratio {cfg.warmup_ratio:.3f})")
         print(f"  Save every steps: {cfg.save_every_steps}")
         print(f"  keep_last_n: {cfg.keep_last_n} | keep_every_steps: {cfg.keep_every_steps}")
         print("=" * 70)
@@ -1113,6 +1124,7 @@ def main():
     p.add_argument("--min_lr", type=float, default=3e-5)
     p.add_argument("--memory_lr_scale", type=float, default=0.1)
     p.add_argument("--warmup_steps", type=int, default=50)
+    p.add_argument("--warmup_ratio", type=float, default=None, help="Override warmup_steps as ratio of total_steps.")
     p.add_argument("--weight_decay", type=float, default=0.1)
 
     p.add_argument("--use_adamw", action="store_true")
@@ -1164,6 +1176,7 @@ def main():
         min_lr=args.min_lr,
         memory_lr_scale=args.memory_lr_scale,
         warmup_steps=args.warmup_steps,
+        warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         use_m3_optimizer=(not args.use_adamw),
         use_torch_compile=args.compile,
