@@ -1,0 +1,570 @@
+{
+  "alerts": [
+    "ALERT_LOOPING",
+    "ALERT_COLLAPSE"
+  ],
+  "checkpoint": "/Users/owner/Desktop/caiatech/models/onyx/checkpoints/checkpoint_final_step_1357.pt",
+  "checkpoint_step": 1357,
+  "copy_tests": {
+    "avg_edit_similarity": 0.008922538595411655,
+    "by_item": [
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_001",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: abc abc abc\nAssistant:",
+        "target": "abc abc abc"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_002",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: 123 123 123\nAssistant:",
+        "target": "123 123 123"
+      },
+      {
+        "edit_similarity": 0.016393442622950838,
+        "exact": false,
+        "id": "copy_003",
+        "json_ok": null,
+        "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are333333333333333333333333",
+        "prompt": "User: Repeat exactly: hello hello\nAssistant:",
+        "target": "hello hello"
+      },
+      {
+        "edit_similarity": 0.03664921465968585,
+        "exact": false,
+        "id": "copy_004",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: onyx onyx onyx onyx\nAssistant:",
+        "target": "onyx onyx onyx onyx"
+      },
+      {
+        "edit_similarity": 0.005235602094240788,
+        "exact": false,
+        "id": "copy_005",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: ZYX-9 ZYX-9\nAssistant:",
+        "target": "ZYX-9 ZYX-9"
+      },
+      {
+        "edit_similarity": 0.015706806282722474,
+        "exact": false,
+        "id": "copy_006",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: A B C D\nAssistant:",
+        "target": "A B C D"
+      },
+      {
+        "edit_similarity": 0.02617801047120416,
+        "exact": false,
+        "id": "copy_007",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: token_1 token_2 token_3\nAssistant:",
+        "target": "token_1 token_2 token_3"
+      },
+      {
+        "edit_similarity": 0.020942408376963373,
+        "exact": false,
+        "id": "copy_008",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: 0 1 2 3 4\nAssistant:",
+        "target": "0 1 2 3 4"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_009",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: (())[]{}\nAssistant:",
+        "target": "(())[]{}"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_010",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: <> <> <>\nAssistant:",
+        "target": "<> <> <>"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_011",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: !!!???\nAssistant:",
+        "target": "!!!???"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_012",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: ,.;:\nAssistant:",
+        "target": ",.;:"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_013",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: --==--==\nAssistant:",
+        "target": "--==--=="
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_014",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: [1](2){3}\nAssistant:",
+        "target": "[1](2){3}"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_015",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: @#$%^&\nAssistant:",
+        "target": "@#$%^&"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_016",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: ::--::--\nAssistant:",
+        "target": "::--::--"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_017",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: ()()((()))\nAssistant:",
+        "target": "()()((()))"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_018",
+        "json_ok": null,
+        "output": ":",
+        "prompt": "User: Print exactly 2 lines: lineA, lineB\nAssistant:",
+        "target": "lineA\nlineB"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_019",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Print exactly 3 lines: line1, line2, line3\nAssistant:",
+        "target": "line1\nline2\nline3"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_020",
+        "json_ok": null,
+        "output": ":",
+        "prompt": "User: Print exactly 4 lines: a, b, c, d\nAssistant:",
+        "target": "a\nb\nc\nd"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_021",
+        "json_ok": null,
+        "output": ":",
+        "prompt": "User: Print exactly 2 lines: first, second\nAssistant:",
+        "target": "first\nsecond"
+      },
+      {
+        "edit_similarity": 0.015706806282722474,
+        "exact": false,
+        "id": "copy_022",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Print exactly 3 lines: one, two, three\nAssistant:",
+        "target": "one\ntwo\nthree"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_023",
+        "json_ok": null,
+        "output": ":",
+        "prompt": "User: Print exactly 2 lines: left, right\nAssistant:",
+        "target": "left\nright"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_024",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Print exactly 3 lines: red, green, blue\nAssistant:",
+        "target": "red\ngreen\nblue"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_025",
+        "json_ok": null,
+        "output": ":",
+        "prompt": "User: Print exactly 2 lines: up, down\nAssistant:",
+        "target": "up\ndown"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_026",
+        "json_ok": false,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: {\"a\":1}\nAssistant:",
+        "target": "{\"a\":1}"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_027",
+        "json_ok": false,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: {\"a\":1,\"b\":2}\nAssistant:",
+        "target": "{\"a\":1,\"b\":2}"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_028",
+        "json_ok": false,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: {\"x\":[1,2]}\nAssistant:",
+        "target": "{\"x\":[1,2]}"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_029",
+        "json_ok": false,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: {\"ok\":true}\nAssistant:",
+        "target": "{\"ok\":true}"
+      },
+      {
+        "edit_similarity": 0.005235602094240788,
+        "exact": false,
+        "id": "copy_030",
+        "json_ok": false,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: {\"name\":\"bob\"}\nAssistant:",
+        "target": "{\"name\":\"bob\"}"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_031",
+        "json_ok": false,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: {\"a\":1,\"b\":{\"c\":2}}\nAssistant:",
+        "target": "{\"a\":1,\"b\":{\"c\":2}}"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_032",
+        "json_ok": false,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: {\"arr\":[0,1,2]}\nAssistant:",
+        "target": "{\"arr\":[0,1,2]}"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_033",
+        "json_ok": false,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: {\"k\":\"v\",\"n\":0}\nAssistant:",
+        "target": "{\"k\":\"v\",\"n\":0}"
+      },
+      {
+        "edit_similarity": 0.020942408376963373,
+        "exact": false,
+        "id": "copy_034",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: hello world\nAssistant:",
+        "target": "hello world"
+      },
+      {
+        "edit_similarity": 0.02617801047120416,
+        "exact": false,
+        "id": "copy_035",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: good morning\nAssistant:",
+        "target": "good morning"
+      },
+      {
+        "edit_similarity": 0.02617801047120416,
+        "exact": false,
+        "id": "copy_036",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: nice to meet you\nAssistant:",
+        "target": "nice to meet you"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_037",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: thanks\nAssistant:",
+        "target": "thanks"
+      },
+      {
+        "edit_similarity": 0.005235602094240788,
+        "exact": false,
+        "id": "copy_038",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: okay\nAssistant:",
+        "target": "okay"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_039",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: i understand\nAssistant:",
+        "target": "i understand"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_040",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: that is all\nAssistant:",
+        "target": "that is all"
+      },
+      {
+        "edit_similarity": 0.015706806282722474,
+        "exact": false,
+        "id": "copy_041",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Output exactly: please proceed\nAssistant:",
+        "target": "please proceed"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_042",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: xqz-19 :: xqz-19\nAssistant:",
+        "target": "xqz-19 :: xqz-19"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_043",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: ab_cd-ef :: ab_cd-ef\nAssistant:",
+        "target": "ab_cd-ef :: ab_cd-ef"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_044",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: 9x9=81 :: 9x9=81\nAssistant:",
+        "target": "9x9=81 :: 9x9=81"
+      },
+      {
+        "edit_similarity": 0.005649717514124242,
+        "exact": false,
+        "id": "copy_045",
+        "json_ok": null,
+        "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are33333333333333333333333333",
+        "prompt": "User: Repeat exactly: id_007 id_007\nAssistant:",
+        "target": "id_007 id_007"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_046",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: zz##zz :: zz##zz\nAssistant:",
+        "target": "zz##zz :: zz##zz"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_047",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: aa__bb :: aa__bb\nAssistant:",
+        "target": "aa__bb :: aa__bb"
+      },
+      {
+        "edit_similarity": 0.041884816753926746,
+        "exact": false,
+        "id": "copy_048",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: r1-r2-r3 :: r1-r2-r3\nAssistant:",
+        "target": "r1-r2-r3 :: r1-r2-r3"
+      },
+      {
+        "edit_similarity": 0.010471204188481686,
+        "exact": false,
+        "id": "copy_049",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: p0:p1:p2 :: p0:p1:p2\nAssistant:",
+        "target": "p0:p1:p2 :: p0:p1:p2"
+      },
+      {
+        "edit_similarity": 0.015706806282722474,
+        "exact": false,
+        "id": "copy_050",
+        "json_ok": null,
+        "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+        "prompt": "User: Repeat exactly: zzz zzz zzz zzz\nAssistant:",
+        "target": "zzz zzz zzz zzz"
+      }
+    ],
+    "exact_match_rate": 0.0,
+    "json_parse_success_rate": 0.0
+  },
+  "generation_metrics": {
+    "max_run_length": 256,
+    "num_prompts": 20,
+    "repeat_1gram_rate": 0.9965337954939342,
+    "repeat_3gram_rate": 0.9861111111111112,
+    "total_tokens": 1154,
+    "unique_token_ratio": 0.0034662045060658577
+  },
+  "loss": {
+    "train_loss": null,
+    "val_loss": 7.63849773054495,
+    "val_loss_slope": null,
+    "val_loss_slope_window": 5,
+    "val_ppl": 2076.621826583649,
+    "val_tokens": 487
+  },
+  "samples": [
+    {
+      "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are333333333",
+      "prompt": "User: Hi\nAssistant:"
+    },
+    {
+      "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are33333333333333333",
+      "prompt": "User: Hello\nAssistant:"
+    },
+    {
+      "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are",
+      "prompt": "User: Tell me something.\nAssistant:"
+    },
+    {
+      "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+      "prompt": "User: Explain what a file is.\nAssistant:"
+    },
+    {
+      "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+      "prompt": "User: What is the color of the sky?\nAssistant:"
+    },
+    {
+      "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+      "prompt": "User: Count to three.\nAssistant:"
+    },
+    {
+      "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+      "prompt": "User: Give me a short sentence.\nAssistant:"
+    },
+    {
+      "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are3333333333333333",
+      "prompt": "User: Say one word.\nAssistant:"
+    },
+    {
+      "output": ":",
+      "prompt": "User: Describe a cat in one sentence.\nAssistant:"
+    },
+    {
+      "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+      "prompt": "User: What is 2+2?\nAssistant:"
+    },
+    {
+      "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are3333333333333",
+      "prompt": "User: Define table.\nAssistant:"
+    },
+    {
+      "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+      "prompt": "User: Translate 'hello' to Spanish.\nAssistant:"
+    },
+    {
+      "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are33333333333333333333333333",
+      "prompt": "User: Tell a very short story.\nAssistant:"
+    },
+    {
+      "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are333333333333333333333333",
+      "prompt": "User: List two fruits.\nAssistant:"
+    },
+    {
+      "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are3333333",
+      "prompt": "User: What is a computer?\nAssistant:"
+    },
+    {
+      "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+      "prompt": "User: Finish the phrase: good night and ...\nAssistant:"
+    },
+    {
+      "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are3333333333333",
+      "prompt": "User: Provide a simple greeting.\nAssistant:"
+    },
+    {
+      "output": "or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or or",
+      "prompt": "User: What is 1+1?\nAssistant:"
+    },
+    {
+      "output": "are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are are33333333",
+      "prompt": "User: Give a random word.\nAssistant:"
+    },
+    {
+      "output": ":",
+      "prompt": "User: Explain what an atom is in one sentence.\nAssistant:"
+    }
+  ],
+  "sanity": {
+    "broken_pipeline": false,
+    "roundtrip_ok": true,
+    "special_tokens_ok": true,
+    "vocab_matches": true
+  },
+  "timestamp": "2025-12-23T08:56:21+00:00"
+}
