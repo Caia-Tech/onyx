@@ -1,0 +1,570 @@
+{
+  "alerts": [
+    "ALERT_LOOPING",
+    "ALERT_COLLAPSE"
+  ],
+  "checkpoint": "/Users/owner/Desktop/caiatech/models/onyx/checkpoints/checkpoint_final_step_7385.pt",
+  "checkpoint_step": 7385,
+  "copy_tests": {
+    "avg_edit_similarity": 0.0504756441092705,
+    "by_item": [
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_001",
+        "json_ok": null,
+        "output": "::...",
+        "prompt": "User: Repeat exactly: abc abc abc\nAssistant:",
+        "target": "abc abc abc"
+      },
+      {
+        "edit_similarity": 0.0444444444444444,
+        "exact": false,
+        "id": "copy_002",
+        "json_ok": null,
+        "output": ":::::: ( ( ( ( ( ( ( (t, and and and the one.",
+        "prompt": "User: Repeat exactly: 123 123 123\nAssistant:",
+        "target": "123 123 123"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_003",
+        "json_ok": null,
+        "output": ":.",
+        "prompt": "User: Repeat exactly: hello hello\nAssistant:",
+        "target": "hello hello"
+      },
+      {
+        "edit_similarity": 0.052631578947368474,
+        "exact": false,
+        "id": "copy_004",
+        "json_ok": null,
+        "output": ":: the.",
+        "prompt": "User: Repeat exactly: onyx onyx onyx onyx\nAssistant:",
+        "target": "onyx onyx onyx onyx"
+      },
+      {
+        "edit_similarity": 0.05555555555555558,
+        "exact": false,
+        "id": "copy_005",
+        "json_ok": null,
+        "output": ": a a a a a the *.",
+        "prompt": "User: Repeat exactly: ZYX-9 ZYX-9\nAssistant:",
+        "target": "ZYX-9 ZYX-9"
+      },
+      {
+        "edit_similarity": 0.030303030303030276,
+        "exact": false,
+        "id": "copy_006",
+        "json_ok": null,
+        "output": ": ' '-------------------------------------------------------------",
+        "prompt": "User: Repeat exactly: A B C D\nAssistant:",
+        "target": "A B C D"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_007",
+        "json_ok": null,
+        "output": ":\n\n\n\n\n\n\n\n\n\n-----------------------------------------------------",
+        "prompt": "User: Repeat exactly: token_1 token_2 token_3\nAssistant:",
+        "target": "token_1 token_2 token_3"
+      },
+      {
+        "edit_similarity": 0.15384615384615385,
+        "exact": false,
+        "id": "copy_008",
+        "json_ok": null,
+        "output": "::,, and and.",
+        "prompt": "User: Repeat exactly: 0 1 2 3 4\nAssistant:",
+        "target": "0 1 2 3 4"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_009",
+        "json_ok": null,
+        "output": ": the, and and can\u2019ss.",
+        "prompt": "User: Output exactly: (())[]{}\nAssistant:",
+        "target": "(())[]{}"
+      },
+      {
+        "edit_similarity": 0.018018018018018056,
+        "exact": false,
+        "id": "copy_010",
+        "json_ok": null,
+        "output": ":::: (s, and and and and and and and in a a a a a a a, and and and and and (mmm\n\n\n\n\n-----------------------to-t",
+        "prompt": "User: Output exactly: <> <> <>\nAssistant:",
+        "target": "<> <> <>"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_011",
+        "json_ok": null,
+        "output": ":::::::::, and and and and is a a...",
+        "prompt": "User: Output exactly: !!!???\nAssistant:",
+        "target": "!!!???"
+      },
+      {
+        "edit_similarity": 0.09999999999999998,
+        "exact": false,
+        "id": "copy_012",
+        "json_ok": null,
+        "output": ":::::.....",
+        "prompt": "User: Output exactly: ,.;:\nAssistant:",
+        "target": ",.;:"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_013",
+        "json_ok": null,
+        "output": ":: a, a a, and and and and can\u2019sssss.",
+        "prompt": "User: Output exactly: --==--==\nAssistant:",
+        "target": "--==--=="
+      },
+      {
+        "edit_similarity": 0.011627906976744207,
+        "exact": false,
+        "id": "copy_014",
+        "json_ok": null,
+        "output": ": a a, and and the ' ( (ssssssssss, or or or or---------------------------------------",
+        "prompt": "User: Output exactly: [1](2){3}\nAssistant:",
+        "target": "[1](2){3}"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_015",
+        "json_ok": null,
+        "output": ":: a.",
+        "prompt": "User: Output exactly: @#$%^&\nAssistant:",
+        "target": "@#$%^&"
+      },
+      {
+        "edit_similarity": 0.25,
+        "exact": false,
+        "id": "copy_016",
+        "json_ok": null,
+        "output": ":: \u201c....",
+        "prompt": "User: Output exactly: ::--::--\nAssistant:",
+        "target": "::--::--"
+      },
+      {
+        "edit_similarity": 0.012048192771084376,
+        "exact": false,
+        "id": "copy_017",
+        "json_ok": null,
+        "output": ":: ' ' ', and and and (t, and and and and can\u2019sss////ss, 2, or or as the the first.",
+        "prompt": "User: Output exactly: ()()((()))\nAssistant:",
+        "target": "()()((()))"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_018",
+        "json_ok": null,
+        "output": ":::\n\n-----------------------------------------------------------",
+        "prompt": "User: Print exactly 2 lines: lineA, lineB\nAssistant:",
+        "target": "lineA\nlineB"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_019",
+        "json_ok": null,
+        "output": "------------------------------------------------------------",
+        "prompt": "User: Print exactly 3 lines: line1, line2, line3\nAssistant:",
+        "target": "line1\nline2\nline3"
+      },
+      {
+        "edit_similarity": 0.07407407407407407,
+        "exact": false,
+        "id": "copy_020",
+        "json_ok": null,
+        "output": ":, and and and and and and.",
+        "prompt": "User: Print exactly 4 lines: a, b, c, d\nAssistant:",
+        "target": "a\nb\nc\nd"
+      },
+      {
+        "edit_similarity": 0.024390243902439046,
+        "exact": false,
+        "id": "copy_021",
+        "json_ok": null,
+        "output": ":: a a a a a, and and and and (tt-------------------------------------------sssss,",
+        "prompt": "User: Print exactly 2 lines: first, second\nAssistant:",
+        "target": "first\nsecond"
+      },
+      {
+        "edit_similarity": 0.010309278350515427,
+        "exact": false,
+        "id": "copy_022",
+        "json_ok": null,
+        "output": ":, and and and and and and and and and ( ( (sssssss--------------------------------------ininin\n`",
+        "prompt": "User: Print exactly 3 lines: one, two, three\nAssistant:",
+        "target": "one\ntwo\nthree"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_023",
+        "json_ok": null,
+        "output": ", and and and and and and and and and and and and and and and a a a, and and and and and and and can------------------------------------",
+        "prompt": "User: Print exactly 2 lines: left, right\nAssistant:",
+        "target": "left\nright"
+      },
+      {
+        "edit_similarity": 0.0714285714285714,
+        "exact": false,
+        "id": "copy_024",
+        "json_ok": null,
+        "output": ", and and..",
+        "prompt": "User: Print exactly 3 lines: red, green, blue\nAssistant:",
+        "target": "red\ngreen\nblue"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_025",
+        "json_ok": null,
+        "output": ": it.",
+        "prompt": "User: Print exactly 2 lines: up, down\nAssistant:",
+        "target": "up\ndown"
+      },
+      {
+        "edit_similarity": 0.11111111111111116,
+        "exact": false,
+        "id": "copy_026",
+        "json_ok": false,
+        "output": ": a ' '..",
+        "prompt": "User: Output exactly: {\"a\":1}\nAssistant:",
+        "target": "{\"a\":1}"
+      },
+      {
+        "edit_similarity": 0.15384615384615385,
+        "exact": false,
+        "id": "copy_027",
+        "json_ok": false,
+        "output": "::.",
+        "prompt": "User: Output exactly: {\"a\":1,\"b\":2}\nAssistant:",
+        "target": "{\"a\":1,\"b\":2}"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_028",
+        "json_ok": false,
+        "output": ":\n\n-------------------------------------------------------------",
+        "prompt": "User: Output exactly: {\"x\":[1,2]}\nAssistant:",
+        "target": "{\"x\":[1,2]}"
+      },
+      {
+        "edit_similarity": 0.08333333333333337,
+        "exact": false,
+        "id": "copy_029",
+        "json_ok": false,
+        "output": ":::::: the the ' '\u2019t, and and can\u2019s.",
+        "prompt": "User: Output exactly: {\"ok\":true}\nAssistant:",
+        "target": "{\"ok\":true}"
+      },
+      {
+        "edit_similarity": 0.020618556701030966,
+        "exact": false,
+        "id": "copy_030",
+        "json_ok": false,
+        "output": ": the the the the real, and and and and in a a a a a a a a a a a a a a-------------------in---ret",
+        "prompt": "User: Output exactly: {\"name\":\"bob\"}\nAssistant:",
+        "target": "{\"name\":\"bob\"}"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_031",
+        "json_ok": false,
+        "output": ":::\n\n\n\n\n--------------------------------------------------------",
+        "prompt": "User: Output exactly: {\"a\":1,\"b\":{\"c\":2}}\nAssistant:",
+        "target": "{\"a\":1,\"b\":{\"c\":2}}"
+      },
+      {
+        "edit_similarity": 0.040000000000000036,
+        "exact": false,
+        "id": "copy_032",
+        "json_ok": false,
+        "output": "( ( ( ( (ss, and and\u2019rere",
+        "prompt": "User: Output exactly: {\"arr\":[0,1,2]}\nAssistant:",
+        "target": "{\"arr\":[0,1,2]}"
+      },
+      {
+        "edit_similarity": 0.07407407407407407,
+        "exact": false,
+        "id": "copy_033",
+        "json_ok": false,
+        "output": ": ( (ssss, and and and and.",
+        "prompt": "User: Output exactly: {\"k\":\"v\",\"n\":0}\nAssistant:",
+        "target": "{\"k\":\"v\",\"n\":0}"
+      },
+      {
+        "edit_similarity": 0.09090909090909094,
+        "exact": false,
+        "id": "copy_034",
+        "json_ok": null,
+        "output": ": a?..",
+        "prompt": "User: Output exactly: hello world\nAssistant:",
+        "target": "hello world"
+      },
+      {
+        "edit_similarity": 0.16666666666666663,
+        "exact": false,
+        "id": "copy_035",
+        "json_ok": null,
+        "output": ": a a, and and and and..",
+        "prompt": "User: Output exactly: good morning\nAssistant:",
+        "target": "good morning"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_036",
+        "json_ok": null,
+        "output": ", and and and..",
+        "prompt": "User: Output exactly: nice to meet you\nAssistant:",
+        "target": "nice to meet you"
+      },
+      {
+        "edit_similarity": 0.02631578947368418,
+        "exact": false,
+        "id": "copy_037",
+        "json_ok": null,
+        "output": ":, and and and can----------------------------------------------------------",
+        "prompt": "User: Output exactly: thanks\nAssistant:",
+        "target": "thanks"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_038",
+        "json_ok": null,
+        "output": ":.",
+        "prompt": "User: Output exactly: okay\nAssistant:",
+        "target": "okay"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_039",
+        "json_ok": null,
+        "output": "::::...",
+        "prompt": "User: Output exactly: i understand\nAssistant:",
+        "target": "i understand"
+      },
+      {
+        "edit_similarity": 0.18181818181818177,
+        "exact": false,
+        "id": "copy_040",
+        "json_ok": null,
+        "output": ": a..",
+        "prompt": "User: Output exactly: that is all\nAssistant:",
+        "target": "that is all"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_041",
+        "json_ok": null,
+        "output": "..",
+        "prompt": "User: Output exactly: please proceed\nAssistant:",
+        "target": "please proceed"
+      },
+      {
+        "edit_similarity": 0.05555555555555558,
+        "exact": false,
+        "id": "copy_042",
+        "json_ok": null,
+        "output": ", and and and and.",
+        "prompt": "User: Repeat exactly: xqz-19 :: xqz-19\nAssistant:",
+        "target": "xqz-19 :: xqz-19"
+      },
+      {
+        "edit_similarity": 0.18181818181818177,
+        "exact": false,
+        "id": "copy_043",
+        "json_ok": null,
+        "output": ", and and and and and.",
+        "prompt": "User: Repeat exactly: ab_cd-ef :: ab_cd-ef\nAssistant:",
+        "target": "ab_cd-ef :: ab_cd-ef"
+      },
+      {
+        "edit_similarity": 0.0625,
+        "exact": false,
+        "id": "copy_044",
+        "json_ok": null,
+        "output": ":,, and and.",
+        "prompt": "User: Repeat exactly: 9x9=81 :: 9x9=81\nAssistant:",
+        "target": "9x9=81 :: 9x9=81"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_045",
+        "json_ok": null,
+        "output": "...",
+        "prompt": "User: Repeat exactly: id_007 id_007\nAssistant:",
+        "target": "id_007 id_007"
+      },
+      {
+        "edit_similarity": 0.125,
+        "exact": false,
+        "id": "copy_046",
+        "json_ok": null,
+        "output": ":::: a a, or..",
+        "prompt": "User: Repeat exactly: zz##zz :: zz##zz\nAssistant:",
+        "target": "zz##zz :: zz##zz"
+      },
+      {
+        "edit_similarity": 0.0,
+        "exact": false,
+        "id": "copy_047",
+        "json_ok": null,
+        "output": ".",
+        "prompt": "User: Repeat exactly: aa__bb :: aa__bb\nAssistant:",
+        "target": "aa__bb :: aa__bb"
+      },
+      {
+        "edit_similarity": 0.06153846153846154,
+        "exact": false,
+        "id": "copy_048",
+        "json_ok": null,
+        "output": "a a--------------------------------------------------------------",
+        "prompt": "User: Repeat exactly: r1-r2-r3 :: r1-r2-r3\nAssistant:",
+        "target": "r1-r2-r3 :: r1-r2-r3"
+      },
+      {
+        "edit_similarity": 0.15000000000000002,
+        "exact": false,
+        "id": "copy_049",
+        "json_ok": null,
+        "output": ":::,,, and and.",
+        "prompt": "User: Repeat exactly: p0:p1:p2 :: p0:p1:p2\nAssistant:",
+        "target": "p0:p1:p2 :: p0:p1:p2"
+      },
+      {
+        "edit_similarity": 0.030000000000000027,
+        "exact": false,
+        "id": "copy_050",
+        "json_ok": null,
+        "output": ": a a.\n\n\n\n\n\n\n\n-------------------------------------s and and are are you are are are a a a a new new",
+        "prompt": "User: Repeat exactly: zzz zzz zzz zzz\nAssistant:",
+        "target": "zzz zzz zzz zzz"
+      }
+    ],
+    "exact_match_rate": 0.0,
+    "json_parse_success_rate": 0.0
+  },
+  "generation_metrics": {
+    "max_run_length": 63,
+    "num_prompts": 20,
+    "repeat_1gram_rate": 0.9666136724960255,
+    "repeat_3gram_rate": 0.8389154704944178,
+    "total_tokens": 629,
+    "unique_token_ratio": 0.033386327503974564
+  },
+  "loss": {
+    "train_loss": null,
+    "val_loss": 5.211217677006956,
+    "val_loss_slope": -0.0003415911257024537,
+    "val_loss_slope_window": 5,
+    "val_ppl": 183.3171434137977,
+    "val_tokens": 488
+  },
+  "samples": [
+    {
+      "output": ":,,,, and the the--------------------------------------------------------",
+      "prompt": "User: Hi\nAssistant:"
+    },
+    {
+      "output": "::::::, and and and and and and.\n\n\n\n\n-------------------------------------------bb",
+      "prompt": "User: Hello\nAssistant:"
+    },
+    {
+      "output": "::.",
+      "prompt": "User: Tell me something.\nAssistant:"
+    },
+    {
+      "output": "::::, and and, and and and.",
+      "prompt": "User: Explain what a file is.\nAssistant:"
+    },
+    {
+      "output": ":: (a, and\u2019ssss and and and and and and and and and and and and and and can\u2019tt.",
+      "prompt": "User: What is the color of the sky?\nAssistant:"
+    },
+    {
+      "output": "\u201c\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014it",
+      "prompt": "User: Count to three.\nAssistant:"
+    },
+    {
+      "output": ": a a a a a clear.",
+      "prompt": "User: Give me a short sentence.\nAssistant:"
+    },
+    {
+      "output": ": \u201c \u201c \u201c\u2019s..",
+      "prompt": "User: Say one word.\nAssistant:"
+    },
+    {
+      "output": ":\n--------------------------------------------------------------",
+      "prompt": "User: Describe a cat in one sentence.\nAssistant:"
+    },
+    {
+      "output": "::\n\n------------------------------------------------------------",
+      "prompt": "User: What is 2+2?\nAssistant:"
+    },
+    {
+      "output": ":, a,, and and and can\u2019ssss,,,, and can\u2019s.",
+      "prompt": "User: Define table.\nAssistant:"
+    },
+    {
+      "output": ", and and.",
+      "prompt": "User: Translate 'hello' to Spanish.\nAssistant:"
+    },
+    {
+      "output": "a?",
+      "prompt": "User: Tell a very short story.\nAssistant:"
+    },
+    {
+      "output": ":.",
+      "prompt": "User: List two fruits.\nAssistant:"
+    },
+    {
+      "output": "::::, and and and and and.",
+      "prompt": "User: What is a computer?\nAssistant:"
+    },
+    {
+      "output": ":\n\n\n\n\n\n\n--------------------------------------------------------",
+      "prompt": "User: Finish the phrase: good night and ...\nAssistant:"
+    },
+    {
+      "output": ":::,, and,.\n\n\n\n\n----------------------------------------inin.",
+      "prompt": "User: Provide a simple greeting.\nAssistant:"
+    },
+    {
+      "output": "::, and and and and can\u2019ss.",
+      "prompt": "User: What is 1+1?\nAssistant:"
+    },
+    {
+      "output": ":: a and (s, and and.",
+      "prompt": "User: Give a random word.\nAssistant:"
+    },
+    {
+      "output": ":---------------------------------------------------------------",
+      "prompt": "User: Explain what an atom is in one sentence.\nAssistant:"
+    }
+  ],
+  "sanity": {
+    "broken_pipeline": false,
+    "roundtrip_ok": true,
+    "special_tokens_ok": true,
+    "vocab_matches": true
+  },
+  "timestamp": "2025-12-23T13:27:11+00:00"
+}
