@@ -193,7 +193,7 @@ def _strip_leading_role_prefixes(text: str) -> str:
     return s.lstrip()
 
 
-def _iter_jsonl_texts(filepath: str) -> Iterator[Union[str, Dict[str, str]]]:
+def _iter_jsonl_texts(filepath: str) -> Iterator[Union[str, Dict[str, Any]]]:
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -204,6 +204,28 @@ def _iter_jsonl_texts(filepath: str) -> Iterator[Union[str, Dict[str, str]]]:
             except json.JSONDecodeError:
                 continue
             if not isinstance(data, dict):
+                continue
+
+            chat = data.get("chat")
+            if not isinstance(chat, list):
+                chat = data.get("chats")
+            if isinstance(chat, list) and chat:
+                cleaned: List[Dict[str, str]] = []
+                for turn in chat:
+                    if not isinstance(turn, dict):
+                        continue
+                    user = turn.get("user")
+                    assistant = turn.get("assistant")
+                    style = turn.get("style", "")
+                    if not isinstance(user, str) or not isinstance(assistant, str):
+                        continue
+                    if not user or not assistant:
+                        continue
+                    if not isinstance(style, str):
+                        style = ""
+                    cleaned.append({"user": user, "assistant": assistant, "style": style})
+                if cleaned:
+                    yield {"chat": cleaned}
                 continue
 
             text = data.get("text") or data.get("content") or data.get("input") or ""
@@ -346,6 +368,51 @@ class StreamingPackedDataset(IterableDataset):
 
             toks = prompt_ids + assistant_ids + [self.eod_token_id]
             labels = ([-100] * len(prompt_ids)) + assistant_ids + [self.eod_token_id]
+            return toks, labels
+
+        if isinstance(doc, dict) and "chat" in doc and isinstance(doc["chat"], list):
+            toks: List[int] = []
+            labels: List[int] = []
+            prev_style = ""
+            first_turn = True
+
+            for turn in doc["chat"]:
+                if not isinstance(turn, dict):
+                    continue
+                user = turn.get("user") if isinstance(turn.get("user"), str) else ""
+                assistant = turn.get("assistant") if isinstance(turn.get("assistant"), str) else ""
+                style = turn.get("style") if isinstance(turn.get("style"), str) else ""
+
+                user = _strip_leading_role_prefixes(user.strip())
+                assistant = _strip_leading_role_prefixes(assistant.strip())
+                style = _strip_leading_role_prefixes(style.strip())
+                if not user or not assistant:
+                    continue
+
+                prompt = ""
+                if not first_turn:
+                    prompt += "\n\n"
+                if style and (first_turn or style != prev_style):
+                    prompt += f"System: {style}\n\n"
+                prompt += f"User: {user}\nAssistant: "
+
+                prompt_ids = self._tokenize(prompt)
+                assistant_ids = self._tokenize(assistant)
+                if not prompt_ids or not assistant_ids:
+                    continue
+
+                toks.extend(prompt_ids)
+                labels.extend([-100] * len(prompt_ids))
+                toks.extend(assistant_ids)
+                labels.extend(assistant_ids)
+
+                prev_style = style
+                first_turn = False
+
+            if not toks:
+                return None
+            toks.append(self.eod_token_id)
+            labels.append(self.eod_token_id)
             return toks, labels
 
         return None
