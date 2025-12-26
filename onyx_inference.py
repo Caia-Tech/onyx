@@ -10,6 +10,7 @@ import time
 import sys
 import dataclasses
 import re
+import io
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Generator, Tuple
 import torch
@@ -29,6 +30,18 @@ _LEADING_ASSISTANT_RE = re.compile(r"^\s*(assistant\s*:+\s*)+", flags=re.IGNOREC
 
 def _supports_color() -> bool:
     return bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+
+def _configure_utf8_stdout() -> None:
+    if not sys.stdout:
+        return
+    if getattr(sys.stdout, "encoding", "").lower() == "utf-8":
+        return
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+        return
+    if isinstance(sys.stdout, io.TextIOBase):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 
 def _onyx_blue(text: str) -> str:
@@ -290,6 +303,7 @@ def chat(model: Onyx, tokenizer, device: torch.device, dtype: torch.dtype, memor
             model.save_memory_states(memory_states, memory_path)
 
 def main():
+    _configure_utf8_stdout()
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--model_config", type=str, default=None)
