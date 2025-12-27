@@ -192,6 +192,51 @@ def _strip_leading_role_prefixes(text: str) -> str:
         s = s[m.end() :]
     return s.lstrip()
 
+def _jsonl_record_to_doc(data: Dict[str, Any]) -> Optional[Union[str, Dict[str, Any]]]:
+    if not isinstance(data, dict):
+        return None
+
+    chat = data.get("chat")
+    if not isinstance(chat, list):
+        chat = data.get("chats")
+    if isinstance(chat, list) and chat:
+        cleaned: List[Dict[str, str]] = []
+        for turn in chat:
+            if not isinstance(turn, dict):
+                continue
+            user = turn.get("user")
+            assistant = turn.get("assistant")
+            style = turn.get("style", "")
+            if not isinstance(user, str) or not isinstance(assistant, str):
+                continue
+            if not user or not assistant:
+                continue
+            if not isinstance(style, str):
+                style = ""
+            cleaned.append({"user": user, "assistant": assistant, "style": style})
+        if cleaned:
+            return {"chat": cleaned}
+        return None
+
+    text = data.get("text") or data.get("content") or data.get("input") or ""
+    if not text:
+        system = data.get("system")
+        user = data.get("user")
+        assistant = data.get("assistant")
+        if isinstance(user, str) and isinstance(assistant, str):
+            # If the record is chat-shaped, yield a structured doc so we can
+            # mask loss on the prompt and train only on the assistant span.
+            return {
+                "system": system if isinstance(system, str) else "",
+                "user": user,
+                "assistant": assistant,
+            }
+        return None
+
+    if isinstance(text, str) and text:
+        return text
+    return None
+
 
 def _iter_jsonl_texts(filepath: str) -> Iterator[Union[str, Dict[str, Any]]]:
     with open(filepath, "r", encoding="utf-8") as f:
@@ -203,56 +248,9 @@ def _iter_jsonl_texts(filepath: str) -> Iterator[Union[str, Dict[str, Any]]]:
                 data = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(data, dict):
-                continue
-
-            chat = data.get("chat")
-            if not isinstance(chat, list):
-                chat = data.get("chats")
-            if isinstance(chat, list) and chat:
-                cleaned: List[Dict[str, str]] = []
-                for turn in chat:
-                    if not isinstance(turn, dict):
-                        continue
-                    user = turn.get("user")
-                    assistant = turn.get("assistant")
-                    style = turn.get("style", "")
-                    if not isinstance(user, str) or not isinstance(assistant, str):
-                        continue
-                    if not user or not assistant:
-                        continue
-                    if not isinstance(style, str):
-                        style = ""
-                    cleaned.append({"user": user, "assistant": assistant, "style": style})
-                if cleaned:
-                    yield {"chat": cleaned}
-                continue
-
-            text = data.get("text") or data.get("content") or data.get("input") or ""
-            if not text:
-                system = data.get("system")
-                user = data.get("user")
-                assistant = data.get("assistant")
-                if isinstance(user, str) and isinstance(assistant, str):
-                    # If the record is chat-shaped, yield a structured doc so we can
-                    # mask loss on the prompt and train only on the assistant span.
-                    yield {
-                        "system": system if isinstance(system, str) else "",
-                        "user": user,
-                        "assistant": assistant,
-                    }
-                    continue
-
-                    system = system.strip() if isinstance(system, str) else ""
-                    user = user.strip()
-                    assistant = assistant.strip()
-                    if system:
-                        text = f"System: {system}\n\nUser: {user}\nAssistant: {assistant}"
-                    else:
-                        text = f"User: {user}\nAssistant: {assistant}"
-
-            if isinstance(text, str) and text:
-                yield text
+            doc = _jsonl_record_to_doc(data)
+            if doc is not None:
+                yield doc
 
 
 class StreamingPackedDataset(IterableDataset):
@@ -293,6 +291,10 @@ class StreamingPackedDataset(IterableDataset):
         if self.eod_token_id is None:
             self.eod_token_id = tokenizer.pad_token_id or 0
 
+        self._doc_rng = random.Random(self.seed)
+        self._doc_state: Optional[Dict[str, Any]] = None
+        self._pack_state: Optional[Dict[str, Any]] = None
+
     def _get_files(self) -> List[str]:
         from glob import glob
         g = self.data_glob
@@ -300,31 +302,165 @@ class StreamingPackedDataset(IterableDataset):
             return [g] if os.path.exists(g) else []
         return sorted(glob(g))
 
-    def _iter_documents(self) -> Iterator[str]:
-        rng = random.Random(self.seed)
-
+    def _init_doc_state(self) -> Dict[str, Any]:
+        self._doc_rng = random.Random(self.seed)
         files = list(self.data_files)
-        rng.shuffle(files)  # cheap shuffle across files
+        self._doc_rng.shuffle(files)
+        self._doc_state = {
+            "files": files,
+            "file_index": 0,
+            "file_pos": 0,
+            "buffer": [],
+            "buffer_index": 0,
+            "exhausted": False,
+        }
+        return self._doc_state
 
-        if self.shuffle_buffer_docs <= 1:
-            for fp in files:
-                yield from _iter_jsonl_texts(fp)
+    def _reset_stream_state(self) -> None:
+        self._doc_state = None
+        self._pack_state = None
+
+    def state_dict(self) -> Dict[str, Any]:
+        ds_state = self._doc_state or {}
+        pack_state = self._pack_state or {}
+        return {
+            "version": 1,
+            "data_glob": self.data_glob,
+            "data_files": list(self.data_files),
+            "pack": self.pack,
+            "max_seq_len": self.max_seq_len,
+            "drop_remainder": self.drop_remainder,
+            "shuffle_buffer_docs": self.shuffle_buffer_docs,
+            "seed": self.seed,
+            "doc_state": {
+                "files": list(ds_state.get("files", [])),
+                "file_index": int(ds_state.get("file_index", 0)),
+                "file_pos": ds_state.get("file_pos", 0),
+                "buffer": list(ds_state.get("buffer", [])),
+                "buffer_index": int(ds_state.get("buffer_index", 0)),
+                "exhausted": bool(ds_state.get("exhausted", False)),
+            } if ds_state else None,
+            "pack_state": {
+                "current_seq": list(pack_state.get("current_seq", [])),
+                "current_labels": list(pack_state.get("current_labels", [])),
+                "current_boundaries": list(pack_state.get("current_boundaries", [])),
+            } if pack_state else None,
+            "rng_state": self._doc_rng.getstate() if self._doc_rng is not None else None,
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if not state:
+            return
+        if state.get("pack") != self.pack or state.get("max_seq_len") != self.max_seq_len:
+            print("[WARN] Dataset state mismatch (pack/max_seq_len); ignoring resume state.")
+            return
+        if state.get("drop_remainder") != self.drop_remainder or state.get("shuffle_buffer_docs") != self.shuffle_buffer_docs:
+            print("[WARN] Dataset state mismatch (drop_remainder/shuffle_buffer_docs); ignoring resume state.")
+            return
+        if state.get("data_files") and list(state.get("data_files")) != list(self.data_files):
+            print("[WARN] Dataset files differ from checkpoint; ignoring resume state.")
             return
 
-        buf: List[str] = []
-        for fp in files:
-            for text in _iter_jsonl_texts(fp):
-                buf.append(text)
-                if len(buf) >= self.shuffle_buffer_docs:
-                    rng.shuffle(buf)
-                    for t in buf:
-                        yield t
-                    buf.clear()
+        self._doc_state = state.get("doc_state") or None
+        self._pack_state = state.get("pack_state") or None
+        self._doc_rng = random.Random(self.seed)
+        rng_state = state.get("rng_state")
+        if rng_state is not None:
+            self._doc_rng.setstate(rng_state)
 
-        if buf:
-            rng.shuffle(buf)
-            for t in buf:
-                yield t
+        if self._doc_state:
+            buf_len = len(self._doc_state.get("buffer", []))
+            seq_len = len((self._pack_state or {}).get("current_seq", []))
+            print(f"[Resume] Dataset state loaded: file_index={self._doc_state.get('file_index', 0)}, buffer={buf_len}, seq={seq_len}")
+
+    def _iter_documents(self) -> Iterator[Union[str, Dict[str, Any]]]:
+        state = self._doc_state
+        if state is None or state.get("exhausted"):
+            state = self._init_doc_state()
+
+        rng = self._doc_rng
+        file_handle = None
+
+        def _open_current_file() -> bool:
+            nonlocal file_handle
+            if file_handle is not None:
+                file_handle.close()
+            if state["file_index"] >= len(state["files"]):
+                file_handle = None
+                return False
+            path = state["files"][state["file_index"]]
+            file_handle = open(path, "r", encoding="utf-8")
+            pos = state.get("file_pos", 0) or 0
+            if pos:
+                file_handle.seek(pos)
+            return True
+
+        def _read_next_doc() -> Optional[Union[str, Dict[str, Any]]]:
+            nonlocal file_handle
+            while True:
+                if file_handle is None:
+                    if not _open_current_file():
+                        return None
+                line = file_handle.readline()
+                if not line:
+                    file_handle.close()
+                    file_handle = None
+                    state["file_index"] += 1
+                    state["file_pos"] = 0
+                    continue
+                state["file_pos"] = file_handle.tell()
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                doc = _jsonl_record_to_doc(data)
+                if doc is None:
+                    continue
+                return doc
+
+        try:
+            while True:
+                if self.shuffle_buffer_docs <= 1:
+                    doc = _read_next_doc()
+                    if doc is None:
+                        state["exhausted"] = True
+                        break
+                    yield doc
+                    continue
+
+                if state["buffer_index"] < len(state["buffer"]):
+                    doc = state["buffer"][state["buffer_index"]]
+                    state["buffer_index"] += 1
+                    if state["buffer_index"] >= len(state["buffer"]):
+                        state["buffer"] = []
+                        state["buffer_index"] = 0
+                    yield doc
+                    continue
+
+                while len(state["buffer"]) < self.shuffle_buffer_docs:
+                    doc = _read_next_doc()
+                    if doc is None:
+                        break
+                    state["buffer"].append(doc)
+
+                if state["buffer"]:
+                    rng.shuffle(state["buffer"])
+                    doc = state["buffer"][0]
+                    state["buffer_index"] = 1
+                    if state["buffer_index"] >= len(state["buffer"]):
+                        state["buffer"] = []
+                        state["buffer_index"] = 0
+                    yield doc
+                    continue
+
+                state["exhausted"] = True
+                break
+        finally:
+            if file_handle is not None:
+                file_handle.close()
 
     def _tokenize(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
@@ -424,9 +560,16 @@ class StreamingPackedDataset(IterableDataset):
         each packed document segment within the fixed-length chunk, always
         starting at 0 and ending at `max_seq_len`.
         """
-        current_seq: List[int] = []
-        current_labels: List[int] = []
-        current_boundaries: List[int] = [0]  # doc start offsets within current_seq
+        if self._pack_state is None:
+            self._pack_state = {
+                "current_seq": [],
+                "current_labels": [],
+                "current_boundaries": [0],
+            }
+
+        current_seq: List[int] = self._pack_state.get("current_seq", [])
+        current_labels: List[int] = self._pack_state.get("current_labels", [])
+        current_boundaries: List[int] = self._pack_state.get("current_boundaries", [0]) or [0]
 
         def _dedup_consecutive(xs: List[int]) -> List[int]:
             if not xs:
@@ -463,15 +606,22 @@ class StreamingPackedDataset(IterableDataset):
                     b.append(self.max_seq_len)
                 b = _dedup_consecutive(b)
 
-                yield seq, lab, b, None
-
-                # Shift leftovers and boundaries down by max_seq_len.
+                # Update state before yielding so resume continues at the next chunk.
                 current_seq = current_seq[self.max_seq_len :]
                 current_labels = current_labels[self.max_seq_len :]
                 shifted = [v - self.max_seq_len for v in current_boundaries if v >= self.max_seq_len]
                 if not shifted or shifted[0] != 0:
                     shifted.insert(0, 0)  # doc continuation starts at 0 in the new chunk
                 current_boundaries = _dedup_consecutive(shifted)
+                self._pack_state["current_seq"] = current_seq
+                self._pack_state["current_labels"] = current_labels
+                self._pack_state["current_boundaries"] = current_boundaries
+
+                yield seq, lab, b, None
+
+            self._pack_state["current_seq"] = current_seq
+            self._pack_state["current_labels"] = current_labels
+            self._pack_state["current_boundaries"] = current_boundaries
 
         if current_seq and not self.drop_remainder:
             pad_start = None
@@ -488,11 +638,21 @@ class StreamingPackedDataset(IterableDataset):
                 b.append(self.max_seq_len)
             b = _dedup_consecutive(b)
 
+            self._pack_state["current_seq"] = []
+            self._pack_state["current_labels"] = []
+            self._pack_state["current_boundaries"] = [0]
+
             yield current_seq[: self.max_seq_len], current_labels[: self.max_seq_len], b, pad_start
 
+        if self._doc_state and self._doc_state.get("exhausted"):
+            self._reset_stream_state()
+
     def _simple_sequences(self) -> Iterator[Tuple[List[int], List[int], Optional[int]]]:
-        buf: List[int] = []
-        buf_labels: List[int] = []
+        if self._pack_state is None:
+            self._pack_state = {"current_seq": [], "current_labels": []}
+
+        buf: List[int] = self._pack_state.get("current_seq", [])
+        buf_labels: List[int] = self._pack_state.get("current_labels", [])
         for doc in self._iter_documents():
             tok_pair = self._tokenize_doc(doc)
             if tok_pair is None:
@@ -502,9 +662,15 @@ class StreamingPackedDataset(IterableDataset):
             buf_labels.extend(labels)
 
             while len(buf) >= self.max_seq_len:
-                yield buf[: self.max_seq_len], buf_labels[: self.max_seq_len], None
+                seq = buf[: self.max_seq_len]
+                lab = buf_labels[: self.max_seq_len]
                 buf = buf[self.max_seq_len :]
                 buf_labels = buf_labels[self.max_seq_len :]
+                self._pack_state["current_seq"] = buf
+                self._pack_state["current_labels"] = buf_labels
+                yield seq, lab, None
+            self._pack_state["current_seq"] = buf
+            self._pack_state["current_labels"] = buf_labels
 
         if buf and not self.drop_remainder:
             pad_start = None
@@ -513,9 +679,17 @@ class StreamingPackedDataset(IterableDataset):
                 pad = self.max_seq_len - len(buf)
                 buf.extend([self.eod_token_id] * pad)
                 buf_labels.extend([-100] * pad)
+            self._pack_state["current_seq"] = []
+            self._pack_state["current_labels"] = []
             yield buf[: self.max_seq_len], buf_labels[: self.max_seq_len], pad_start
 
+        if self._doc_state and self._doc_state.get("exhausted"):
+            self._reset_stream_state()
+
     def __iter__(self) -> Iterator[Dict[str, Any]]:
+        if self._doc_state is None or self._doc_state.get("exhausted"):
+            self._reset_stream_state()
+            self._init_doc_state()
         if self.pack:
             for seq, lab, boundaries, pad_start in self._pack_sequences_with_boundaries():
                 input_ids = torch.tensor(seq, dtype=torch.long)
@@ -582,6 +756,7 @@ class Trainer:
 
         self.resume_vocab_size: Optional[int] = None
         self.init_vocab_size: Optional[int] = None
+        self._pending_rng_state: Optional[Dict[str, Any]] = None
 
     def _handle_signal(self, signum, frame):
         print(f"\n[SIGNAL] Received {signum}, will save and exit after current step...")
@@ -609,6 +784,30 @@ class Trainer:
         new_t[:rows] = t[:rows]
         state_dict[key] = new_t
         print(f"Resized {key}: {tuple(t.shape)} -> {tuple(target.shape)}")
+
+    def _get_rng_state(self) -> Dict[str, Any]:
+        state: Dict[str, Any] = {
+            "python": random.getstate(),
+            "torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _set_rng_state(self, state: Dict[str, Any]) -> None:
+        if not state:
+            return
+        py_state = state.get("python")
+        if py_state is not None:
+            random.setstate(py_state)
+        torch_state = state.get("torch")
+        if torch_state is not None:
+            torch.set_rng_state(torch_state)
+        if "cuda" in state:
+            if torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(state["cuda"])
+            else:
+                print("[WARN] Checkpoint has CUDA RNG state, but CUDA is not available.")
 
     def setup(self):
         cfg = self.config
@@ -1004,6 +1203,10 @@ class Trainer:
         print(f"  keep_last_n: {cfg.keep_last_n} | keep_every_steps: {cfg.keep_every_steps}")
         print("=" * 70)
 
+        if self._pending_rng_state is not None:
+            self._set_rng_state(self._pending_rng_state)
+            self._pending_rng_state = None
+
         memory_states = None
         start_time = time.time()
         log_loss = 0.0
@@ -1086,6 +1289,9 @@ class Trainer:
             "current_epoch": getattr(self, "current_epoch", 0),
             "config": vars(cfg),
         }
+        ckpt["rng_state"] = self._get_rng_state()
+        if hasattr(self, "dataset") and hasattr(self.dataset, "state_dict"):
+            ckpt["dataset_state"] = self.dataset.state_dict()
         if self.scaler is not None:
             ckpt["scaler_state_dict"] = self.scaler.state_dict()
 
@@ -1121,6 +1327,16 @@ class Trainer:
         self.tokens_seen = int(ckpt.get("tokens_seen", 0))
         self.best_loss = float(ckpt.get("best_loss", float("inf")))
         self.current_epoch = int(ckpt.get("current_epoch", 0))
+
+        self._pending_rng_state = ckpt.get("rng_state")
+        self._set_rng_state(self._pending_rng_state)
+        if hasattr(self, "dataset") and "dataset_state" in ckpt:
+            try:
+                self.dataset.load_state_dict(ckpt["dataset_state"])
+                if hasattr(self, "dataloader"):
+                    self.data_iter = iter(self.dataloader)
+            except Exception as e:
+                print(f"[WARN] Failed to load dataset state: {e}")
 
         print(f"  Resumed at step {self.global_step}, tokens_seen={self.tokens_seen:,}")
 

@@ -1,5 +1,6 @@
 import glob
 import os
+import random
 from pathlib import Path
 
 import torch
@@ -83,3 +84,65 @@ def test_resume_restores_global_step(tmp_path: Path):
 
     assert t2.global_step == 4242
     assert t2.tokens_seen == 123
+
+
+def test_checkpoint_restores_rng_state(tmp_path: Path):
+    cfg = TrainingConfig(data_glob="unused.jsonl", save_dir=str(tmp_path))
+    t = Trainer(cfg)
+
+    model = Onyx(
+        OnyxConfig(
+            d_model=32,
+            n_layers=1,
+            n_heads=1,
+            n_kv_heads=1,
+            head_dim=32,
+            d_ff=64,
+            vocab_size=50,
+            max_seq_len=16,
+            train_seq_len=16,
+        )
+    )
+    t.model = model
+    t.optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    t.scaler = None
+    t.tokens_seen = 0
+    t.best_loss = 0.0
+    t.current_epoch = 0
+    t.global_step = 1
+
+    py_state = random.getstate()
+    torch_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        random.seed(1234)
+        torch.manual_seed(1234)
+        _ = random.random()
+        _ = torch.rand(1)
+
+        t.save_checkpoint("step_1")
+        path = os.path.join(str(tmp_path), "checkpoint_step_1.pt")
+
+        expected_py = random.random()
+        expected_torch = torch.rand(1)
+
+        random.seed(9999)
+        torch.manual_seed(9999)
+
+        t2 = Trainer(cfg)
+        t2.model = Onyx(model.config)
+        t2.optimizer = torch.optim.AdamW(t2.model.parameters(), lr=1e-3)
+        t2.scaler = None
+        t2.load_checkpoint(path)
+
+        _ = random.random()
+        _ = torch.rand(1)
+        t2._set_rng_state(t2._pending_rng_state)
+
+        assert random.random() == expected_py
+        assert torch.allclose(torch.rand(1), expected_torch)
+    finally:
+        random.setstate(py_state)
+        torch.set_rng_state(torch_state)
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_state)
