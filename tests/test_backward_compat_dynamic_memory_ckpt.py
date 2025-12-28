@@ -1,6 +1,6 @@
 import torch
 
-from onyx_model import OnyxConfig, ChunkedLinearDeltaMemory
+from onyx.model import OnyxConfig, ChunkedLinearDeltaMemory
 
 
 def test_old_state_dict_without_dynamic_hyperparams_loads_strict():

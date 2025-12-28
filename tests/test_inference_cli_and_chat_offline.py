@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-import onyx_inference
+import onyx.inference as onyx_inference
 
 
 class TinyTokenizer:
@@ -110,7 +110,7 @@ def test_inference_main_prompt_path_offline(monkeypatch, tmp_path: Path):
     torch.save({"model_state_dict": {}}, ckpt)
 
     argv = [
-        "onyx_inference.py",
+        "scripts/infer.py",
         "--checkpoint",
         str(ckpt),
         "--tokenizer",
@@ -197,7 +197,7 @@ def test_load_model_model_config_path_branch_offline(tmp_path: Path):
     cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
 
     # Minimal checkpoint with matching tensors.
-    import onyx_model
+    import onyx.model as onyx_model
 
     m = onyx_model.Onyx(onyx_model.OnyxConfig(**cfg["architecture"]))
     ckpt_path = tmp_path / "ckpt.pt"

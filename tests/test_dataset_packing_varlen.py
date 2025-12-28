@@ -1,6 +1,6 @@
 import torch
 
-from onyx_train import StreamingPackedDataset
+from onyx.train import StreamingPackedDataset
 
 
 def _assert_labels_match_input_except_padding(sample):

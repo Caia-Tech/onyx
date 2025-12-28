@@ -21,7 +21,7 @@ try:
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
-from onyx_model import Onyx, OnyxConfig
+from onyx.model import Onyx, OnyxConfig
 
 _TURN_MARKERS = ("\nUser:", "\nAssistant:", "\nSystem:")
 _LEADING_ASSISTANT_RE = re.compile(r"^\s*(assistant\s*:+\s*)+", flags=re.IGNORECASE)

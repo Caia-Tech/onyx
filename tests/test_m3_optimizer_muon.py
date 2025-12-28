@@ -1,6 +1,6 @@
 import torch
 
-from onyx_model import M3Optimizer, zeropower_via_newtonschulz5
+from onyx.model import M3Optimizer, zeropower_via_newtonschulz5
 
 
 def test_newton_schulz_zeropower_returns_approximately_orthogonal_square():

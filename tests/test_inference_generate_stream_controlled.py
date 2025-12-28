@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from onyx_inference import generate_stream
+from onyx.inference import generate_stream
 
 
 @dataclass

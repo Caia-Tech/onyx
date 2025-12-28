@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run OnyxDistiller with a training-style dataset/dataloader.
+Run OnyxMemoryConsolidator with a training-style dataset/dataloader.
 """
 
 from __future__ import annotations
@@ -18,9 +18,13 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from onyx_distiller import OnyxDistiller
-from onyx_model import Onyx, OnyxConfig
-from onyx_train import StreamingPackedDataset, collate_onyx
+from _bootstrap import add_repo_root
+
+add_repo_root()
+
+from onyx.memory_consolidator import OnyxMemoryConsolidator
+from onyx.model import Onyx, OnyxConfig
+from onyx.train import StreamingPackedDataset, collate_onyx
 
 
 def _load_model_config(path: str, max_seq_len: int) -> OnyxConfig:
@@ -109,7 +113,7 @@ def _estimate_steps(dataloader: DataLoader) -> int:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Distill Onyx memory parameters with EWC.")
+    p = argparse.ArgumentParser(description="Consolidate Onyx memory parameters with EWC.")
     p.add_argument("--checkpoint", required=True, help="Checkpoint path (training format).")
     p.add_argument("--model_config", required=True, help="Model config JSON path.")
     p.add_argument("--tokenizer", required=True, help="Tokenizer name or local path.")
@@ -128,7 +132,7 @@ def main() -> int:
     p.add_argument("--ewc_lambda", type=float, default=500.0)
     p.add_argument("--fisher_sample_size", type=int, default=0)
     p.add_argument("--importance_threshold", type=float, default=1e-5)
-    p.add_argument("--init_fisher", action="store_true", help="Precompute Fisher/anchors before distill.")
+    p.add_argument("--init_fisher", action="store_true", help="Precompute Fisher/anchors before consolidation.")
 
     p.add_argument("--steps_per_epoch", type=int, default=0, help="Override steps per epoch.")
     p.add_argument("--max_batches", type=int, default=0, help="Limit batches per epoch.")
@@ -136,8 +140,8 @@ def main() -> int:
     p.add_argument("--device", type=str, default=None, help="cpu|cuda|mps (default: auto).")
     p.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
     p.add_argument("--memory_state", type=str, default=None, help="Optional memory state path.")
-    p.add_argument("--save_model", type=str, default=None, help="Save distilled model checkpoint.")
-    p.add_argument("--save_distiller", type=str, default=None, help="Save distiller state.")
+    p.add_argument("--save_model", type=str, default=None, help="Save consolidated model checkpoint.")
+    p.add_argument("--save_distiller", type=str, default=None, help="Save consolidator state.")
     args = p.parse_args()
 
     random.seed(args.seed)
@@ -206,7 +210,7 @@ def main() -> int:
     wrapped_loader = LimitedDataloader(dataloader, steps_per_epoch, max_batches)
 
     fisher_sample_size = args.fisher_sample_size if args.fisher_sample_size > 0 else None
-    distiller = OnyxDistiller(
+    consolidator = OnyxMemoryConsolidator(
         model=model,
         dataloader=wrapped_loader,
         device=device,
@@ -222,14 +226,14 @@ def main() -> int:
 
     if args.init_fisher:
         print("Precomputing Fisher/anchors...")
-        distiller.fisher_diagonal = distiller.estimate_importance(memory_states, verbose=True)
-        distiller.theta_star = {
+        consolidator.fisher_diagonal = consolidator.estimate_importance(memory_states, verbose=True)
+        consolidator.theta_star = {
             n: p.data.clone()
             for n, p in model.named_parameters()
             if p.requires_grad
         }
 
-    metrics = distiller.distill(
+    metrics = consolidator.consolidate(
         memory_states=memory_states,
         epochs=args.epochs,
         lr=args.lr,
@@ -246,10 +250,10 @@ def main() -> int:
             "config": dataclasses.asdict(config),
         }
         torch.save(ckpt_out, args.save_model)
-        print(f"Saved model checkpoint: {args.save_model}")
+        print(f"Saved consolidated model checkpoint: {args.save_model}")
 
     if args.save_distiller:
-        distiller.save_checkpoint(args.save_distiller)
+        consolidator.save_checkpoint(args.save_distiller)
 
     return 0
 

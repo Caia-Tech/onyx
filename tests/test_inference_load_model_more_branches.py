@@ -3,8 +3,8 @@ from pathlib import Path
 
 import torch
 
-import onyx_inference
-from onyx_model import Onyx, OnyxConfig
+import onyx.inference as onyx_inference
+from onyx.model import Onyx, OnyxConfig
 
 
 def test_load_model_reads_checkpoint_referenced_model_config_path(tmp_path: Path):

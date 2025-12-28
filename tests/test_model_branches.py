@@ -1,6 +1,6 @@
 import torch
 
-from onyx_model import Onyx, OnyxConfig
+from onyx.model import Onyx, OnyxConfig
 
 
 def test_standard_attention_forward_runs():

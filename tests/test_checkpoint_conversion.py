@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 
 import convert_checkpoint
-from onyx_model import Onyx, OnyxConfig
+from onyx.model import Onyx, OnyxConfig
 
 
 def _write_config(path: Path, arch: dict) -> None:

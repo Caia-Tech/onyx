@@ -5,7 +5,11 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from onyx_model import OnyxConfig, Onyx
+from _bootstrap import add_repo_root
+
+add_repo_root()
+
+from onyx.model import OnyxConfig, Onyx
 
 
 def _load_config(path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:

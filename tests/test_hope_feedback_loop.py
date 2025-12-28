@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from onyx_model import OnyxConfig, ChunkedLinearDeltaMemory, ChunkedSelfReferentialMemory
+from onyx.model import OnyxConfig, ChunkedLinearDeltaMemory, ChunkedSelfReferentialMemory
 
 
 def test_chunked_linear_delta_memory_uses_target_generator_for_delta_error():

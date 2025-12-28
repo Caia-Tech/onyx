@@ -1,8 +1,8 @@
 import torch
 from torch.utils.data import DataLoader
 
-from onyx_model import Onyx, OnyxConfig
-from onyx_train import Trainer, TrainingConfig, StreamingPackedDataset, collate_onyx
+from onyx.model import Onyx, OnyxConfig
+from onyx.train import Trainer, TrainingConfig, StreamingPackedDataset, collate_onyx
 
 
 def test_trainer_train_step_respects_cms_update_schedule(dummy_tokenizer, tiny_jsonl):

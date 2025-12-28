@@ -1,6 +1,6 @@
 import torch
 
-from onyx_train import TrainingConfig, get_lr, set_lr
+from onyx.train import TrainingConfig, get_lr, set_lr
 
 
 def test_get_lr_warmup_and_cosine_decay_bounds():

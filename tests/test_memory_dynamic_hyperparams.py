@@ -1,6 +1,6 @@
 import torch
 
-from onyx_model import OnyxConfig, ChunkedLinearDeltaMemory
+from onyx.model import OnyxConfig, ChunkedLinearDeltaMemory
 
 
 def test_dynamic_memory_hyperparams_are_input_dependent_in_training_mode():

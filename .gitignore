@@ -57,6 +57,7 @@ Thumbs.db
 *.log
 logs/
 wandb/
+early_eval_reports/
 
 # Memory states
 memory_states/

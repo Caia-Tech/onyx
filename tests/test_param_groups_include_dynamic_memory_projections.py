@@ -1,4 +1,4 @@
-from onyx_model import Onyx, OnyxConfig, get_param_groups
+from onyx.model import Onyx, OnyxConfig, get_param_groups
 
 
 def test_get_param_groups_includes_dynamic_memory_projection_params():

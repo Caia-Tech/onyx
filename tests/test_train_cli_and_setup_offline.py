@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-import onyx_train
+import onyx.train as onyx_train
 
 
 class DummyAutoTokenizer:
@@ -96,7 +96,7 @@ def test_train_main_parses_args_and_dry_run_without_network(monkeypatch, tmp_pat
     monkeypatch.setattr(onyx_train.Trainer, "train", _train, raising=True)
 
     argv = [
-        "onyx_train.py",
+        "scripts/train.py",
         "--data_glob",
         tiny_jsonl,
         "--save_dir",

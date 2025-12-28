@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from onyx_model import OnyxConfig, CMSFFN
-from onyx_train import CMSFrequencyManager
+from onyx.model import OnyxConfig, CMSFFN
+from onyx.train import CMSFrequencyManager
 
 
 class TinyCMSModel(nn.Module):

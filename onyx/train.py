@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import IterableDataset, DataLoader
 
-from onyx_model import (
+from onyx.model import (
     Onyx,
     OnyxConfig,
     M3Optimizer,

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from onyx_train import StreamingPackedDataset
+from onyx.train import StreamingPackedDataset
 
 
 def _normalize_sample(sample):

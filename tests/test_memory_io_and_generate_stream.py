@@ -1,6 +1,6 @@
 import torch
 
-from onyx_inference import generate_stream
+from onyx.inference import generate_stream
 
 
 def _mem_allclose(a, b, atol=0.0, rtol=0.0):
@@ -29,7 +29,7 @@ def test_save_and_load_memory_states_roundtrip(tiny_model, tiny_config, tmp_path
     tiny_model.save_memory_states(mem1, str(p))
 
     # Load into a fresh model instance.
-    from onyx_model import Onyx
+    from onyx.model import Onyx
 
     m2 = Onyx(tiny_model.config).cpu().eval()
     loaded = m2.load_memory_states(str(p), device=torch.device("cpu"), dtype=torch.float32)

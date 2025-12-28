@@ -1,6 +1,6 @@
 import torch
 
-from onyx_inference import sample_token
+from onyx.inference import sample_token
 
 
 def test_sample_token_temperature_zero_is_argmax():

@@ -1,11 +1,9 @@
-import os
 import torch
-import torch.nn as nn
 from typing import Dict, Optional, List
 from tqdm import tqdm
-from onyx_model import Onyx, OnyxConfig, M3Optimizer
+from onyx.model import Onyx, M3Optimizer
 
-class OnyxDistiller:
+class OnyxMemoryConsolidator:
     def __init__(
         self, 
         model: Onyx, 
@@ -16,7 +14,7 @@ class OnyxDistiller:
         importance_threshold: float = 1e-5
     ):
         """
-        Knowledge Distillation with EWC for Onyx Model.
+        Memory consolidation with EWC for Onyx.
         
         Args:
             model: Onyx model instance
@@ -169,7 +167,7 @@ class OnyxDistiller:
         
         return (self.ewc_lambda / 2) * penalty
     
-    def distill(
+    def consolidate(
         self, 
         memory_states: Optional[Dict] = None,
         epochs: int = 5,
@@ -179,7 +177,7 @@ class OnyxDistiller:
         validate_fn: Optional[callable] = None
     ) -> Dict[str, List[float]]:
         """
-        Main distillation loop with global optimization.
+        Main consolidation loop with global optimization.
         
         Args:
             memory_states: Optional memory state dict
@@ -208,7 +206,7 @@ class OnyxDistiller:
         }
         
         print(f"\n{'='*60}")
-        print(f"Knowledge Distillation (EWC λ={self.ewc_lambda})")
+        print(f"Memory Consolidation (EWC λ={self.ewc_lambda})")
         print(f"{'='*60}")
         
         for epoch in range(epochs):
@@ -291,11 +289,14 @@ class OnyxDistiller:
             if p.requires_grad
         }
         
-        print(f"✓ Distillation complete\n")
+        print(f"✓ Consolidation complete\n")
         return metrics
+
+    def distill(self, *args, **kwargs) -> Dict[str, List[float]]:
+        return self.consolidate(*args, **kwargs)
     
     def save_checkpoint(self, path: str):
-        """Save distiller state including Fisher and theta_star."""
+        """Save consolidator state including Fisher and theta_star."""
         checkpoint = {
             'theta_star': self.theta_star,
             'fisher_diagonal': self.fisher_diagonal,
@@ -306,7 +307,7 @@ class OnyxDistiller:
         print(f"Checkpoint saved to {path}")
     
     def load_checkpoint(self, path: str):
-        """Load distiller state."""
+        """Load consolidator state."""
         checkpoint = torch.load(path, map_location=self.device)
         self.theta_star = checkpoint['theta_star']
         self.fisher_diagonal = checkpoint['fisher_diagonal']

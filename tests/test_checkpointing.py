@@ -5,8 +5,8 @@ from pathlib import Path
 
 import torch
 
-from onyx_model import Onyx, OnyxConfig
-from onyx_train import Trainer, TrainingConfig
+from onyx.model import Onyx, OnyxConfig
+from onyx.train import Trainer, TrainingConfig
 
 
 def test_checkpoint_cleanup_keeps_last_n(tmp_path: Path):

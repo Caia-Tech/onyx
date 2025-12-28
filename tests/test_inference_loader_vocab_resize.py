@@ -2,8 +2,8 @@ from pathlib import Path
 
 import torch
 
-from onyx_inference import load_model
-from onyx_model import Onyx, OnyxConfig
+from onyx.inference import load_model
+from onyx.model import Onyx, OnyxConfig
 
 
 def test_load_model_pads_vocab_when_ckpt_smaller(tmp_path: Path):

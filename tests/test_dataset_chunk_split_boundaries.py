@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from onyx_train import StreamingPackedDataset
+from onyx.train import StreamingPackedDataset
 
 
 class _Tok:

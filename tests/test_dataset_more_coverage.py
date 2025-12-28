@@ -1,6 +1,6 @@
 import torch
 
-from onyx_train import StreamingPackedDataset
+from onyx.train import StreamingPackedDataset
 
 
 def test_packed_cu_seqlens_contains_internal_boundaries(dummy_tokenizer, tiny_jsonl):

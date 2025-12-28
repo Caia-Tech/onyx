@@ -21,13 +21,17 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from _bootstrap import add_repo_root
+
+add_repo_root()
+
 try:
     from transformers import AutoTokenizer
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
-from onyx_inference import load_model, generate_stream
+from onyx.inference import load_model, generate_stream
 
 
 _LEADING_ASSISTANT_RE = re.compile(r"^\s*(assistant\s*:+\s*)+", flags=re.IGNORECASE)
@@ -721,9 +725,10 @@ def main(argv: List[str]) -> int:
     p.add_argument("--tokenizer", required=True, help="Tokenizer name or local path")
     p.add_argument("--model_config", default=None, help="Optional model config JSON path")
     p.add_argument("--val_data", required=True, help="Frozen validation JSONL")
-    p.add_argument("--out_dir", default=str(Path(__file__).parent / "early_eval_reports"))
-    p.add_argument("--copy_tests", default=str(Path(__file__).parent / "early_eval" / "copy_tests.jsonl"))
-    p.add_argument("--gen_prompts", default=str(Path(__file__).parent / "early_eval" / "gen_prompts.jsonl"))
+    repo_root = Path(__file__).resolve().parents[1]
+    p.add_argument("--out_dir", default=str(repo_root / "early_eval_reports"))
+    p.add_argument("--copy_tests", default=str(repo_root / "early_eval" / "copy_tests.jsonl"))
+    p.add_argument("--gen_prompts", default=str(repo_root / "early_eval" / "gen_prompts.jsonl"))
     p.add_argument("--max_seq_len", type=int, default=1024)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--val_max_tokens", type=int, default=20000)

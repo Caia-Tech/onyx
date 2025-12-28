@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from onyx_model import OnyxConfig, Onyx, M3Optimizer, zeropower_via_newtonschulz5
-from train import CMSFrequencyManager
+from onyx.model import OnyxConfig, Onyx, M3Optimizer, zeropower_via_newtonschulz5
+from onyx.train import CMSFrequencyManager
 
 
 @pytest.fixture
@@ -197,4 +197,3 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main(["-v", __file__]))
-
