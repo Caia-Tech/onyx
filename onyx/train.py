@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """
-Onyx 11M Training Script (Improved)
+Caia Tech
 
-Key fixes vs prior version:
-- CLI flag for keep_last_n + milestone retention keep_every_steps
-- Safe vocab alignment for tokenizer/resume/init_checkpoint
-- Safe init_checkpoint load when vocab differs (resizes embed/lm_head)
-- Iterable dataset is actually streaming (buffer shuffle, no list(all_docs))
-- CUDA varlen cu_seqlens batching uses a collate_fn (ragged-safe)
-- pin_memory only on CUDA
 """
 
 import argparse
+import atexit
+import gc
 import json
 import math
 import os
 import random
 import re
 import signal
+import subprocess
 import sys
 import time
+import resource
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Iterator, List, Dict, Any, Tuple, Union
@@ -47,6 +44,101 @@ try:
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
+
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None
+
+
+class _SimpleLogger:
+    def __init__(self, path: str, tee: bool, flush_logs: bool):
+        self.path = path
+        self.tee = tee
+        self.flush_logs = flush_logs
+        log_dir = os.path.dirname(path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        self._file = open(path, "a", encoding="utf-8")
+        self._stdout = sys.stdout
+
+    def write(self, msg: str) -> None:
+        self._file.write(msg)
+        if self.flush_logs:
+            self._file.flush()
+        if self.tee:
+            self._stdout.write(msg)
+            if self.flush_logs:
+                self._stdout.flush()
+
+    def close(self) -> None:
+        try:
+            if self.flush_logs:
+                self._file.flush()
+            self._file.close()
+        except Exception:
+            pass
+
+
+_LOGGER: Optional[_SimpleLogger] = None
+
+
+def _configure_logger(log_file: str, tee: bool, flush_logs: bool) -> None:
+    global _LOGGER
+    if not log_file:
+        _LOGGER = None
+        return
+    if _LOGGER is not None:
+        return
+    _LOGGER = _SimpleLogger(log_file, tee=tee, flush_logs=flush_logs)
+    atexit.register(_LOGGER.close)
+
+
+def log(msg: str = "", *, end: str = "\n") -> None:
+    if _LOGGER is None:
+        print(msg, end=end)
+        return
+    _LOGGER.write(f"{msg}{end}")
+
+
+def _get_rss_gb() -> float:
+    if psutil is not None:
+        try:
+            rss_bytes = psutil.Process(os.getpid()).memory_info().rss
+            return rss_bytes / (1024 ** 3)
+        except Exception:
+            pass
+    try:
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            rss_bytes = rss
+        else:
+            rss_bytes = rss * 1024
+        return rss_bytes / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())])
+        rss_kb = int(out.strip())
+        return (rss_kb * 1024) / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _get_mps_mem_gb() -> Tuple[Optional[float], Optional[float]]:
+    if hasattr(torch, "mps") and torch.backends.mps.is_available():
+        try:
+            current = torch.mps.current_allocated_memory()
+        except Exception:
+            current = None
+        try:
+            driver = torch.mps.driver_allocated_memory()
+        except Exception:
+            driver = None
+        cur_gb = current / (1024 ** 3) if current is not None else None
+        drv_gb = driver / (1024 ** 3) if driver is not None else None
+        return cur_gb, drv_gb
+    return None, None
 
 
 # =============================================================================
@@ -167,13 +259,25 @@ class TrainingConfig:
     model_config_path: Optional[str] = None
 
     # === Logging ===
-    log_every: int = 10
+    log_every: int = 50
     wandb_project: Optional[str] = None
     wandb_run_name: Optional[str] = None
 
     # === Debug ===
     dry_run: bool = False
     seed: int = 42
+
+    log_file: str = ""
+    tee: bool = False
+    flush_logs: bool = True
+    mem_report_every: int = 50
+    max_rss_gb: float = 0.0
+    max_mps_alloc_gb: float = 0.0
+    auto_interrupt_on_mem: bool = True
+    mps_empty_cache_every: int = 50
+    gc_collect_every: int = 200
+    dataset_state_mode: str = "light"
+    quiet: bool = False
 
 
 # =============================================================================
@@ -283,9 +387,9 @@ class StreamingPackedDataset(IterableDataset):
         if not self.data_files:
             raise ValueError(f"No files found matching: {data_glob}")
 
-        print(f"Found {len(self.data_files)} data file(s)")
+        log(f"Found {len(self.data_files)} data file(s)")
         for f in self.data_files[:5]:
-            print(f"  - {f}")
+            log(f"  - {f}")
 
         self.eod_token_id = tokenizer.eos_token_id
         if self.eod_token_id is None:
@@ -320,9 +424,12 @@ class StreamingPackedDataset(IterableDataset):
         self._doc_state = None
         self._pack_state = None
 
-    def state_dict(self) -> Dict[str, Any]:
+    def state_dict(self, mode: str = "full") -> Dict[str, Any]:
         ds_state = self._doc_state or {}
         pack_state = self._pack_state or {}
+        if mode not in ("full", "light"):
+            raise ValueError(f"Unknown dataset_state_mode: {mode}")
+        buffer = list(ds_state.get("buffer", [])) if mode == "full" else []
         return {
             "version": 1,
             "data_glob": self.data_glob,
@@ -332,12 +439,13 @@ class StreamingPackedDataset(IterableDataset):
             "drop_remainder": self.drop_remainder,
             "shuffle_buffer_docs": self.shuffle_buffer_docs,
             "seed": self.seed,
+            "state_mode": mode,
             "doc_state": {
                 "files": list(ds_state.get("files", [])),
                 "file_index": int(ds_state.get("file_index", 0)),
                 "file_pos": ds_state.get("file_pos", 0),
-                "buffer": list(ds_state.get("buffer", [])),
-                "buffer_index": int(ds_state.get("buffer_index", 0)),
+                "buffer": buffer,
+                "buffer_index": int(ds_state.get("buffer_index", 0)) if mode == "full" else 0,
                 "exhausted": bool(ds_state.get("exhausted", False)),
             } if ds_state else None,
             "pack_state": {
@@ -352,13 +460,13 @@ class StreamingPackedDataset(IterableDataset):
         if not state:
             return
         if state.get("pack") != self.pack or state.get("max_seq_len") != self.max_seq_len:
-            print("[WARN] Dataset state mismatch (pack/max_seq_len); ignoring resume state.")
+            log("[WARN] Dataset state mismatch (pack/max_seq_len); ignoring resume state.")
             return
         if state.get("drop_remainder") != self.drop_remainder or state.get("shuffle_buffer_docs") != self.shuffle_buffer_docs:
-            print("[WARN] Dataset state mismatch (drop_remainder/shuffle_buffer_docs); ignoring resume state.")
+            log("[WARN] Dataset state mismatch (drop_remainder/shuffle_buffer_docs); ignoring resume state.")
             return
         if state.get("data_files") and list(state.get("data_files")) != list(self.data_files):
-            print("[WARN] Dataset files differ from checkpoint; ignoring resume state.")
+            log("[WARN] Dataset files differ from checkpoint; ignoring resume state.")
             return
 
         self._doc_state = state.get("doc_state") or None
@@ -367,11 +475,15 @@ class StreamingPackedDataset(IterableDataset):
         rng_state = state.get("rng_state")
         if rng_state is not None:
             self._doc_rng.setstate(rng_state)
+        if self._doc_state is not None:
+            if "buffer" not in self._doc_state:
+                self._doc_state["buffer"] = []
+                self._doc_state["buffer_index"] = 0
 
         if self._doc_state:
             buf_len = len(self._doc_state.get("buffer", []))
             seq_len = len((self._pack_state or {}).get("current_seq", []))
-            print(f"[Resume] Dataset state loaded: file_index={self._doc_state.get('file_index', 0)}, buffer={buf_len}, seq={seq_len}")
+            log(f"[Resume] Dataset state loaded: file_index={self._doc_state.get('file_index', 0)}, buffer={buf_len}, seq={seq_len}")
 
     def _iter_documents(self) -> Iterator[Union[str, Dict[str, Any]]]:
         state = self._doc_state
@@ -743,6 +855,18 @@ def set_lr(optimizer, lr: float):
         pg["lr"] = lr * scale
 
 
+def _tree_map_tensors(obj: Any, fn):
+    if torch.is_tensor(obj):
+        return fn(obj)
+    if isinstance(obj, dict):
+        return {k: _tree_map_tensors(v, fn) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_tree_map_tensors(v, fn) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_tree_map_tensors(v, fn) for v in obj)
+    return obj
+
+
 # =============================================================================
 # Trainer
 # =============================================================================
@@ -757,9 +881,20 @@ class Trainer:
         self.resume_vocab_size: Optional[int] = None
         self.init_vocab_size: Optional[int] = None
         self._pending_rng_state: Optional[Dict[str, Any]] = None
+        self._rng_restored_once = False
+        self._prefetched_batch: Optional[Dict[str, Any]] = None
+        self.last_memory_states: Optional[Any] = None
+        self._resume_dataset_state_loaded = False
+        self._resume_memory_states_loaded = False
+        self._logger_configured = False
+
+    def _log(self, msg: str, *, force: bool = False) -> None:
+        if not force and getattr(self.config, "quiet", False):
+            return
+        log(msg)
 
     def _handle_signal(self, signum, frame):
-        print(f"\n[SIGNAL] Received {signum}, will save and exit after current step...")
+        self._log(f"\n[SIGNAL] Received {signum}, will save and exit after current step...", force=True)
         self._interrupt_requested = True
 
     def _extract_vocab_size_from_ckpt(self, ckpt: Dict[str, Any]) -> Optional[int]:
@@ -783,7 +918,7 @@ class Trainer:
         rows = min(t.shape[0], target.shape[0])
         new_t[:rows] = t[:rows]
         state_dict[key] = new_t
-        print(f"Resized {key}: {tuple(t.shape)} -> {tuple(target.shape)}")
+        self._log(f"Resized {key}: {tuple(t.shape)} -> {tuple(target.shape)}", force=True)
 
     def _get_rng_state(self) -> Dict[str, Any]:
         state: Dict[str, Any] = {
@@ -802,12 +937,31 @@ class Trainer:
             random.setstate(py_state)
         torch_state = state.get("torch")
         if torch_state is not None:
+            if not isinstance(torch_state, torch.Tensor):
+                torch_state = torch.tensor(torch_state, dtype=torch.uint8)
+            if torch_state.dtype != torch.uint8 or torch_state.device.type != "cpu":
+                torch_state = torch_state.to(device="cpu", dtype=torch.uint8)
             torch.set_rng_state(torch_state)
         if "cuda" in state:
             if torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(state["cuda"])
+                cuda_state = state["cuda"]
+                if isinstance(cuda_state, (list, tuple)):
+                    fixed_states = []
+                    for s in cuda_state:
+                        if not isinstance(s, torch.Tensor):
+                            s = torch.tensor(s, dtype=torch.uint8)
+                        if s.dtype != torch.uint8 or s.device.type != "cpu":
+                            s = s.to(device="cpu", dtype=torch.uint8)
+                        fixed_states.append(s)
+                    torch.cuda.set_rng_state_all(fixed_states)
+                else:
+                    if not isinstance(cuda_state, torch.Tensor):
+                        cuda_state = torch.tensor(cuda_state, dtype=torch.uint8)
+                    if cuda_state.dtype != torch.uint8 or cuda_state.device.type != "cpu":
+                        cuda_state = cuda_state.to(device="cpu", dtype=torch.uint8)
+                    torch.cuda.set_rng_state(cuda_state)
             else:
-                print("[WARN] Checkpoint has CUDA RNG state, but CUDA is not available.")
+                self._log("[WARN] Checkpoint has CUDA RNG state, but CUDA is not available.", force=True)
 
     def setup(self):
         cfg = self.config
@@ -817,15 +971,15 @@ class Trainer:
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
             self.device_type = "cuda"
-            print(f"Using CUDA: {torch.cuda.get_device_name()}")
+            self._log(f"Using CUDA: {torch.cuda.get_device_name()}", force=True)
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             self.device = torch.device("mps")
             self.device_type = "mps"
-            print("Using MPS (Apple Silicon)")
+            self._log("Using MPS (Apple Silicon)", force=True)
         else:
             self.device = torch.device("cpu")
             self.device_type = "cpu"
-            print("Using CPU")
+            self._log("Using CPU", force=True)
             cfg.use_amp = False
 
         if cfg.amp_dtype == "bfloat16":
@@ -840,12 +994,12 @@ class Trainer:
             cfg.use_amp = False
 
         self.use_autocast = cfg.use_amp and self.device_type in ("cuda", "mps")
-        print(f"Autocast dtype: {self.autocast_dtype} | AMP: {cfg.use_amp}")
+        self._log(f"Autocast dtype: {self.autocast_dtype} | AMP: {cfg.use_amp}")
 
         if not TRANSFORMERS_AVAILABLE:
             raise RuntimeError("transformers not installed")
 
-        print(f"Loading tokenizer: {cfg.tokenizer_name}")
+        self._log(f"Loading tokenizer: {cfg.tokenizer_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name, trust_remote_code=True)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -862,7 +1016,7 @@ class Trainer:
 
         # Load model config
         if cfg.model_config_path:
-            print(f"Loading model config from: {cfg.model_config_path}")
+            self._log(f"Loading model config from: {cfg.model_config_path}")
             with open(cfg.model_config_path, "r") as f:
                 json_cfg = json.load(f)
             arch = json_cfg.get("architecture", json_cfg)
@@ -882,7 +1036,7 @@ class Trainer:
                 memory_reg_weight=cfg.memory_reg_weight,
             )
         else:
-            print("Creating Onyx model with default config...")
+            self._log("Creating Onyx model with default config...")
             model_config = OnyxConfig(
                 use_flash_attention=(self.device_type == "cuda"),
                 gradient_checkpointing=(self.device_type == "cuda"),
@@ -896,14 +1050,14 @@ class Trainer:
         ckpt_vs = max([v for v in [self.resume_vocab_size, self.init_vocab_size] if v is not None], default=0)
         target_vs = max(tok_vs, ckpt_vs, model_config.vocab_size)
         if target_vs != model_config.vocab_size:
-            print(f"Adjusting model vocab_size from {model_config.vocab_size} to {target_vs} to match tokenizer/checkpoint.")
+            self._log(f"Adjusting model vocab_size from {model_config.vocab_size} to {target_vs} to match tokenizer/checkpoint.")
             model_config.vocab_size = target_vs
 
         self.model = Onyx(model_config).to(self.device)
 
         # Load weights from init_checkpoint (weights only)
         if cfg.init_checkpoint:
-            print(f"Loading model weights from init_checkpoint: {cfg.init_checkpoint}")
+            self._log(f"Loading model weights from init_checkpoint: {cfg.init_checkpoint}")
             sd = init_meta.get("model_state_dict") if isinstance(init_meta, dict) and "model_state_dict" in init_meta else init_meta
             if not isinstance(sd, dict):
                 raise ValueError("init_checkpoint did not contain a state_dict-like mapping")
@@ -915,10 +1069,10 @@ class Trainer:
                 self._resize_vocab_tensor(sd, "lm_head.weight", self.model.lm_head.weight)
 
             self.model.load_state_dict(sd, strict=True)
-            print("Init weights loaded.")
+            self._log("Init weights loaded.")
 
         # Dataset + loader
-        print(f"Loading dataset from: {cfg.data_glob}")
+        self._log(f"Loading dataset from: {cfg.data_glob}")
         self.dataset = StreamingPackedDataset(
             data_glob=cfg.data_glob,
             tokenizer=self.tokenizer,
@@ -947,7 +1101,7 @@ class Trainer:
         )
 
         if cfg.use_m3_optimizer:
-            print("Using M3 optimizer")
+            self._log("Using M3 optimizer")
             self.optimizer = M3Optimizer(
                 param_groups,
                 lr=cfg.learning_rate,
@@ -957,7 +1111,7 @@ class Trainer:
                 slow_weight=cfg.m3_slow_weight,
             )
         else:
-            print("Using AdamW optimizer")
+            self._log("Using AdamW optimizer")
             self.optimizer = torch.optim.AdamW(
                 param_groups,
                 lr=cfg.learning_rate,
@@ -967,8 +1121,8 @@ class Trainer:
 
         tokens_per_batch = cfg.batch_size * cfg.max_seq_len
         self.accumulation_steps = max(1, cfg.tokens_per_step // max(1, tokens_per_batch))
-        print(f"Gradient accumulation: {self.accumulation_steps} steps")
-        print(f"Tokens per optimizer step: {self.accumulation_steps * tokens_per_batch:,}")
+        self._log(f"Gradient accumulation: {self.accumulation_steps} steps")
+        self._log(f"Tokens per optimizer step: {self.accumulation_steps * tokens_per_batch:,}")
 
         self.scaler = None
         if cfg.use_amp and cfg.amp_dtype == "float16":
@@ -977,9 +1131,9 @@ class Trainer:
             elif self.device_type == "mps":
                 try:
                     self.scaler = torch.amp.GradScaler("mps")
-                    print("Using GradScaler on MPS.")
+                    self._log("Using GradScaler on MPS.")
                 except Exception as e:
-                    print(f"GradScaler not available on MPS: {e}")
+                    self._log(f"GradScaler not available on MPS: {e}", force=True)
 
         self.global_step = 0
         self.tokens_seen = 0
@@ -1000,20 +1154,24 @@ class Trainer:
             )
 
         if cfg.use_torch_compile and self.device_type == "cuda" and hasattr(torch, "compile"):
-            print(f"Compiling model with mode: {cfg.compile_mode}")
+            self._log(f"Compiling model with mode: {cfg.compile_mode}")
             self.model = torch.compile(self.model, mode=cfg.compile_mode)
 
-        print("\nSetup complete!\n")
+        self._log("\nSetup complete!\n")
 
     def get_batch(self) -> Optional[Dict[str, Any]]:
-        try:
-            batch = next(self.data_iter)
-        except StopIteration:
-            self.data_iter = iter(self.dataloader)
+        if self._prefetched_batch is not None:
+            batch = self._prefetched_batch
+            self._prefetched_batch = None
+        else:
             try:
                 batch = next(self.data_iter)
             except StopIteration:
-                return None
+                self.data_iter = iter(self.dataloader)
+                try:
+                    batch = next(self.data_iter)
+                except StopIteration:
+                    return None
 
         out: Dict[str, Any] = {}
         out["input_ids"] = batch["input_ids"].to(self.device)
@@ -1117,6 +1275,8 @@ class Trainer:
         if total_tokens == 0:
             return None, memory_states
 
+        self.last_memory_states = memory_states
+
         if not hasattr(self, "_cms_manager"):
             self._cms_manager = None
             model_cfg = getattr(self.model, "config", None)
@@ -1149,12 +1309,62 @@ class Trainer:
             "tokens": total_tokens,
         }, memory_states
 
+    def _maybe_report_memory(self) -> None:
+        cfg = self.config
+        if cfg.mem_report_every <= 0:
+            return
+        if self.global_step % cfg.mem_report_every != 0:
+            return
+
+        rss_gb = _get_rss_gb()
+        mps_alloc_gb, mps_driver_gb = _get_mps_mem_gb()
+        msg_parts = [f"[Mem] rss_gb={rss_gb:.2f}"]
+        if mps_alloc_gb is not None:
+            msg_parts.append(f"mps_alloc_gb={mps_alloc_gb:.2f}")
+        if mps_driver_gb is not None:
+            msg_parts.append(f"mps_driver_gb={mps_driver_gb:.2f}")
+        self._log(" | ".join(msg_parts), force=True)
+
+        if cfg.wandb_project and WANDB_AVAILABLE:
+            payload = {"train/mem_rss_gb": rss_gb, "train/step": self.global_step}
+            if mps_alloc_gb is not None:
+                payload["train/mps_alloc_gb"] = mps_alloc_gb
+            if mps_driver_gb is not None:
+                payload["train/mps_driver_gb"] = mps_driver_gb
+            wandb.log(payload, step=self.global_step)
+
+        over = []
+        if cfg.max_rss_gb and rss_gb > cfg.max_rss_gb:
+            over.append(f"rss_gb={rss_gb:.2f} > {cfg.max_rss_gb:.2f}")
+        if cfg.max_mps_alloc_gb and mps_alloc_gb is not None and mps_alloc_gb > cfg.max_mps_alloc_gb:
+            over.append(f"mps_alloc_gb={mps_alloc_gb:.2f} > {cfg.max_mps_alloc_gb:.2f}")
+        if over:
+            self._log(f"[WARN] Memory threshold exceeded: {', '.join(over)}", force=True)
+            if cfg.auto_interrupt_on_mem:
+                self._interrupt_requested = True
+
+    def _maybe_cleanup(self) -> None:
+        cfg = self.config
+        if self.device_type == "mps" and cfg.mps_empty_cache_every > 0 and self.global_step % cfg.mps_empty_cache_every == 0:
+            try:
+                torch.mps.empty_cache()
+            except Exception as e:
+                self._log(f"[WARN] torch.mps.empty_cache failed: {e}", force=True)
+        if cfg.gc_collect_every > 0 and self.global_step % cfg.gc_collect_every == 0:
+            gc.collect()
+
     def train(self):
+        if not self._logger_configured:
+            _configure_logger(self.config.log_file, self.config.tee, self.config.flush_logs)
+            self._logger_configured = True
+
         if not hasattr(self, "model"):
             self.setup()
 
         cfg = self.config
         bench_mode = cfg.bench_steps and cfg.bench_steps > 0
+        if not cfg.log_file and cfg.log_every < 10 and sys.platform == "darwin":
+            self._log("Tip: use --log_file to prevent Terminal scrollback memory growth on macOS.", force=True)
 
         if cfg.max_steps is not None:
             total_steps = int(cfg.max_steps)
@@ -1167,12 +1377,12 @@ class Trainer:
             if effective_tps <= 0:
                 effective_tps = max(1, int(cfg.tokens_per_step))
             if int(cfg.tokens_per_step) < effective_tps:
-                print(f"[WARN] tokens_per_step ({cfg.tokens_per_step}) < effective tokens/step ({effective_tps}); using {effective_tps} for --train_tokens_target scheduling.")
+                self._log(f"[WARN] tokens_per_step ({cfg.tokens_per_step}) < effective tokens/step ({effective_tps}); using {effective_tps} for --train_tokens_target scheduling.", force=True)
             total_steps = int(cfg.train_tokens_target // max(1, effective_tps))
         else:
             # If neither is provided, run "epochs" based on a conservative estimate:
             # we approximate steps per epoch by counting batches for one pass.
-            print("No --max_steps or --train_tokens_target provided; estimating steps_per_epoch by one streaming pass...")
+            self._log("No --max_steps or --train_tokens_target provided; estimating steps_per_epoch by one streaming pass...")
             est_steps = 0
             # NOTE: this is a streaming pass; it will take time but not load all docs into RAM.
             for _ in self.dataloader:
@@ -1181,33 +1391,52 @@ class Trainer:
             total_steps = est_steps * max(1, int(cfg.num_epochs))
             # reset iterator
             self.data_iter = iter(self.dataloader)
-            print(f"Estimated steps_per_epoch={est_steps:,} -> total_steps={total_steps:,}")
+            self._log(f"Estimated steps_per_epoch={est_steps:,} -> total_steps={total_steps:,}")
 
         if bench_mode:
             total_steps = self.global_step + int(cfg.bench_steps)
 
         if cfg.warmup_ratio is not None:
             if cfg.warmup_ratio <= 0.0 or cfg.warmup_ratio >= 1.0:
-                print("[WARN] warmup_ratio must be between 0 and 1; ignoring.")
+                self._log("[WARN] warmup_ratio must be between 0 and 1; ignoring.", force=True)
             else:
                 cfg.warmup_steps = max(1, int(total_steps * cfg.warmup_ratio))
                 if cfg.warmup_steps >= total_steps:
                     cfg.warmup_steps = max(1, total_steps - 1)
 
-        print("=" * 70)
-        print("Starting training")
-        print(f"  Total steps: {total_steps:,}")
+        if cfg.resume:
+            resume_lr = get_lr(self.global_step, cfg, total_steps)
+            set_lr(self.optimizer, resume_lr)
+
+        self._log("=" * 70)
+        self._log("Starting training")
+        self._log(f"  Total steps: {total_steps:,}")
         if cfg.warmup_ratio is not None and 0.0 < cfg.warmup_ratio < 1.0:
-            print(f"  Warmup steps: {cfg.warmup_steps} (ratio {cfg.warmup_ratio:.3f})")
-        print(f"  Save every steps: {cfg.save_every_steps}")
-        print(f"  keep_last_n: {cfg.keep_last_n} | keep_every_steps: {cfg.keep_every_steps}")
-        print("=" * 70)
+            self._log(f"  Warmup steps: {cfg.warmup_steps} (ratio {cfg.warmup_ratio:.3f})")
+        self._log(f"  Save every steps: {cfg.save_every_steps}")
+        self._log(f"  keep_last_n: {cfg.keep_last_n} | keep_every_steps: {cfg.keep_every_steps}")
+        self._log("=" * 70)
 
         if self._pending_rng_state is not None:
             self._set_rng_state(self._pending_rng_state)
             self._pending_rng_state = None
+            self._rng_restored_once = True
 
-        memory_states = None
+        if cfg.resume:
+            opt_lrs = [pg.get("lr", 0.0) for pg in self.optimizer.param_groups]
+            sched_lr = get_lr(self.global_step, cfg, total_steps)
+            mem_restored = self._resume_memory_states_loaded
+            self._log(
+                "[Resume] Integrity report: "
+                f"step={self.global_step}, tokens_seen={self.tokens_seen:,}, "
+                f"opt_lrs={[f'{lr:.2e}' for lr in opt_lrs]}, "
+                f"sched_lr={sched_lr:.2e}, "
+                f"memory_states_restored={mem_restored}, "
+                f"rng_restored={self._rng_restored_once}, "
+                f"dataset_state_loaded={self._resume_dataset_state_loaded}"
+            )
+
+        memory_states = self.last_memory_states if self.last_memory_states is not None else None
         start_time = time.time()
         log_loss = 0.0
         log_tokens = 0
@@ -1215,17 +1444,17 @@ class Trainer:
 
         while self.global_step < total_steps:
             if self._interrupt_requested:
-                print("\n[INTERRUPT] Saving checkpoint before exit...")
+                self._log("\n[INTERRUPT] Saving checkpoint before exit...", force=True)
                 self.save_checkpoint(f"interrupt_step_{self.global_step}")
-                print("Checkpoint saved. Exiting.")
+                self._log("Checkpoint saved. Exiting.", force=True)
                 return
+
+            lr = get_lr(self.global_step, cfg, total_steps)
+            set_lr(self.optimizer, lr)
 
             metrics, memory_states = self.train_step(memory_states)
             if metrics is None:
                 continue
-
-            lr = get_lr(self.global_step, cfg, total_steps)
-            set_lr(self.optimizer, lr)
 
             log_loss += metrics["loss"]
             log_tokens += metrics["tokens"]
@@ -1236,9 +1465,8 @@ class Trainer:
                 avg_loss = log_loss / max(1, log_steps)
                 tokps = log_tokens / max(1e-8, elapsed)
 
-                print(
+                self._log(
                     f"Step {self.global_step:6d} | Loss {avg_loss:.4f} | LR {lr:.2e} | Tok/s {tokps:.0f}",
-                    flush=True,
                 )
 
                 if cfg.wandb_project and WANDB_AVAILABLE:
@@ -1256,18 +1484,21 @@ class Trainer:
                 log_steps = 0
                 start_time = time.time()
 
+            self._maybe_report_memory()
+            self._maybe_cleanup()
+
             if cfg.save_every_steps > 0 and (self.global_step % cfg.save_every_steps == 0) and not (bench_mode and cfg.disable_saves_during_bench):
                 self.save_checkpoint(f"step_{self.global_step}")
 
             if bench_mode and (self.global_step >= total_steps):
                 self.save_checkpoint(f"bench_step_{self.global_step}")
-                print("Benchmark complete. Exiting.")
+                self._log("Benchmark complete. Exiting.", force=True)
                 return
 
         self.save_checkpoint(f"final_step_{self.global_step}")
-        print("\nTraining complete!")
-        print(f"  Total steps: {self.global_step:,}")
-        print(f"  Total tokens: {self.tokens_seen:,}")
+        self._log("\nTraining complete!", force=True)
+        self._log(f"  Total steps: {self.global_step:,}", force=True)
+        self._log(f"  Total tokens: {self.tokens_seen:,}", force=True)
 
     def save_checkpoint(self, name: str):
         cfg = self.config
@@ -1290,19 +1521,24 @@ class Trainer:
             "config": vars(cfg),
         }
         ckpt["rng_state"] = self._get_rng_state()
+        if self.last_memory_states is not None:
+            ckpt["memory_states"] = _tree_map_tensors(
+                self.last_memory_states,
+                lambda t: t.detach().to("cpu"),
+            )
         if hasattr(self, "dataset") and hasattr(self.dataset, "state_dict"):
-            ckpt["dataset_state"] = self.dataset.state_dict()
+            ckpt["dataset_state"] = self.dataset.state_dict(mode=cfg.dataset_state_mode)
         if self.scaler is not None:
             ckpt["scaler_state_dict"] = self.scaler.state_dict()
 
         torch.save(ckpt, tmp_path)
         os.replace(tmp_path, path)  # atomic
-        print(f"Saved checkpoint: {path}")
+        self._log(f"Saved checkpoint: {path}", force=True)
 
         self._cleanup_checkpoints()
 
     def load_checkpoint(self, path: str):
-        print(f"Resuming from: {path}")
+        self._log(f"Resuming from: {path}", force=True)
         map_location = getattr(self, "device", torch.device("cpu"))
         ckpt = torch.load(path, map_location=map_location, weights_only=False)
 
@@ -1329,16 +1565,55 @@ class Trainer:
         self.current_epoch = int(ckpt.get("current_epoch", 0))
 
         self._pending_rng_state = ckpt.get("rng_state")
-        self._set_rng_state(self._pending_rng_state)
+        mem_states = ckpt.get("memory_states")
+        if mem_states is not None:
+            self.last_memory_states = _tree_map_tensors(
+                mem_states,
+                lambda t: t.to(self.device),
+            )
+            self._resume_memory_states_loaded = True
+        else:
+            self.last_memory_states = None
+            self._resume_memory_states_loaded = False
+
+        self._resume_dataset_state_loaded = False
         if hasattr(self, "dataset") and "dataset_state" in ckpt:
             try:
                 self.dataset.load_state_dict(ckpt["dataset_state"])
                 if hasattr(self, "dataloader"):
                     self.data_iter = iter(self.dataloader)
+                self._resume_dataset_state_loaded = bool(
+                    getattr(self.dataset, "_doc_state", None) or getattr(self.dataset, "_pack_state", None)
+                )
+                doc_state = getattr(self.dataset, "_doc_state", None) or {}
+                pack_state = getattr(self.dataset, "_pack_state", None) or {}
+                file_pos = doc_state.get("file_pos", 0)
+                pack_seq_len = len(pack_state.get("current_seq", []))
+                pack_label_len = len(pack_state.get("current_labels", []))
+                pack_bound_len = len(pack_state.get("current_boundaries", []))
+                first_batch_tokens = None
+                if hasattr(self, "data_iter"):
+                    try:
+                        self._prefetched_batch = next(self.data_iter)
+                        if self._prefetched_batch is not None and "input_ids" in self._prefetched_batch:
+                            first_batch_tokens = int(self._prefetched_batch["input_ids"].numel())
+                    except StopIteration:
+                        self._prefetched_batch = None
+                    except Exception as e:
+                        self._log(f"[WARN] Resume batch peek failed: {e}", force=True)
+                        self._prefetched_batch = None
+                self._log(
+                    "[Resume] Sanity: "
+                    f"first_batch_tokens={first_batch_tokens}, "
+                    f"file_pos={file_pos}, "
+                    f"pack_seq={pack_seq_len}, "
+                    f"pack_labels={pack_label_len}, "
+                    f"pack_bounds={pack_bound_len}"
+                )
             except Exception as e:
-                print(f"[WARN] Failed to load dataset state: {e}")
+                self._log(f"[WARN] Failed to load dataset state: {e}", force=True)
 
-        print(f"  Resumed at step {self.global_step}, tokens_seen={self.tokens_seen:,}")
+        self._log(f"  Resumed at step {self.global_step}, tokens_seen={self.tokens_seen:,}")
 
     def _cleanup_checkpoints(self):
         cfg = self.config
@@ -1378,7 +1653,7 @@ class Trainer:
                 try:
                     p.unlink()
                 except Exception as e:
-                    print(f"[WARN] Could not delete old checkpoint {p}: {e}")
+                    self._log(f"[WARN] Could not delete old checkpoint {p}: {e}", force=True)
 
 
 # =============================================================================
@@ -1386,7 +1661,17 @@ class Trainer:
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="Train Onyx Model")
+    p = argparse.ArgumentParser(
+        description="Train Onyx Model",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Recommended:\n"
+            "  python -m onyx.train ... --log_file /path/train.log --tee "
+            "--mem_report_every 50 --mps_empty_cache_every 50\n"
+            "Tip: On macOS, Terminal/iTerm scrollback can grow memory quickly. "
+            "Use --log_file (and --tee if you want console output) or limit scrollback."
+        ),
+    )
 
     p.add_argument("--data_glob", type=str, required=True)
     p.add_argument("--tokenizer", type=str, default="NousResearch/Hermes-2-Pro-Llama-3-8B")
@@ -1425,13 +1710,25 @@ def main():
     p.add_argument("--save_every_steps", type=int, default=0)
     p.add_argument("--keep_last_n", type=int, default=5)
     p.add_argument("--keep_every_steps", type=int, default=0)
+    p.add_argument("--dataset_state_mode", type=str, choices=["full", "light"], default="light")
 
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--init_checkpoint", type=str, default=None)
 
-    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument("--log_every", type=int, default=50)
+    p.add_argument("--log_file", type=str, default="")
+    p.add_argument("--tee", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--flush_logs", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_run_name", type=str, default=None)
+
+    p.add_argument("--mem_report_every", type=int, default=50)
+    p.add_argument("--max_rss_gb", type=float, default=0.0)
+    p.add_argument("--max_mps_alloc_gb", type=float, default=0.0)
+    p.add_argument("--auto_interrupt_on_mem", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mps_empty_cache_every", type=int, default=50)
+    p.add_argument("--gc_collect_every", type=int, default=200)
+    p.add_argument("--quiet", action=argparse.BooleanOptionalAction, default=False)
 
     p.add_argument("--dry_run", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -1480,7 +1777,20 @@ def main():
         wandb_run_name=args.wandb_run_name,
         dry_run=args.dry_run,
         seed=args.seed,
+        log_file=args.log_file,
+        tee=args.tee,
+        flush_logs=args.flush_logs,
+        mem_report_every=args.mem_report_every,
+        max_rss_gb=args.max_rss_gb,
+        max_mps_alloc_gb=args.max_mps_alloc_gb,
+        auto_interrupt_on_mem=args.auto_interrupt_on_mem,
+        mps_empty_cache_every=args.mps_empty_cache_every,
+        gc_collect_every=args.gc_collect_every,
+        dataset_state_mode=args.dataset_state_mode,
+        quiet=args.quiet,
     )
+
+    _configure_logger(cfg.log_file, cfg.tee, cfg.flush_logs)
 
     if args.dry_run:
         cfg.max_steps = 3
@@ -1488,7 +1798,7 @@ def main():
         cfg.save_every_steps = 0
         cfg.use_torch_compile = False
         cfg.wandb_project = None
-        print("\nDRY RUN MODE (3 steps)\n")
+        log("\nDRY RUN MODE (3 steps)\n")
 
     Trainer(cfg).train()
 

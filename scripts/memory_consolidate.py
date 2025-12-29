@@ -18,7 +18,10 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from _bootstrap import add_repo_root
+try:
+    from _bootstrap import add_repo_root
+except ImportError:
+    from scripts._bootstrap import add_repo_root
 
 add_repo_root()
 

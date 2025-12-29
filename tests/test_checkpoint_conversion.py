@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-import convert_checkpoint
+import scripts.convert_checkpoint as convert_checkpoint
 from onyx.model import Onyx, OnyxConfig
 
 
