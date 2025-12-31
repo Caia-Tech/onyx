@@ -2,10 +2,38 @@
 set -u
 set -o pipefail
 
+if [[ -z "${CAFFEINATED:-}" ]]; then
+  export CAFFEINATED=1
+  exec caffeinate -dimsu -- "$0" "$@"
+fi
+
 CKPT_DIR="/Users/owner/Desktop/caiatech/models/onyx/checkpoints"
+LOCK_DIR="${CKPT_DIR}/.train_autoresume.lock"
+LOCK_PID_FILE="${LOCK_DIR}/pid"
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  if [[ -f "$LOCK_PID_FILE" ]]; then
+    existing_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null || true)
+    if [[ -n "${existing_pid:-}" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+      echo "Another train_autoresume.sh instance is already running (pid: $existing_pid)." >&2
+      exit 1
+    fi
+  fi
+  rm -f "$LOCK_PID_FILE" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+  mkdir "$LOCK_DIR"
+fi
+
+echo $$ > "$LOCK_PID_FILE"
+
+cleanup_lock() {
+  rm -f "$LOCK_PID_FILE" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup_lock EXIT
 
 BASE_CMD=(
-  caffeinate -dimsu python -m onyx.train
+  python -m onyx.train
   --data_glob "/Users/owner/Desktop/caiatech/datasets/caia-chat.jsonl"
   --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizers/test_32k"
   --model_config "/Users/owner/Desktop/caiatech/models/onyx/configs/onyx_42m.json"
@@ -33,12 +61,34 @@ MAX_SAME_CKPT_FAILURES=2
 
 last_ckpt=""
 same_ckpt_failures=0
+child_pid=""
+stop_requested=0
+
+on_stop() {
+  stop_requested=1
+  if [[ -n "$child_pid" ]]; then
+    kill -TERM "$child_pid" 2>/dev/null || true
+  fi
+}
+trap on_stop INT TERM HUP
+
+get_ckpt_list() {
+  local f base step
+  for f in "$CKPT_DIR"/checkpoint_step_*.pt "$CKPT_DIR"/interrupt_step_*.pt; do
+    [[ -e "$f" ]] || continue
+    base="${f##*/}"
+    step="${base##*_step_}"
+    step="${step%.pt}"
+    [[ "$step" =~ ^[0-9]+$ ]] || continue
+    printf "%s\t%s\n" "$step" "$f"
+  done | sort -nr -k1,1 | cut -f2-
+}
 
 while true; do
   ckpts=()
   while IFS= read -r line; do
     [[ -n "$line" ]] && ckpts+=("$line")
-  done < <(ls -t "$CKPT_DIR"/checkpoint_step_*.pt 2>/dev/null || true)
+  done < <(get_ckpt_list || true)
 
   ckpt=""
   if [[ ${#ckpts[@]} -gt 0 ]]; then
@@ -56,10 +106,18 @@ while true; do
 
   start_ts=$(date +%s)
   echo "Starting: ${CMD[*]}"
-  "${CMD[@]}"
+  "${CMD[@]}" &
+  child_pid=$!
+  wait "$child_pid"
   status=$?
+  child_pid=""
   end_ts=$(date +%s)
   runtime=$((end_ts - start_ts))
+
+  if [[ $stop_requested -eq 1 ]]; then
+    echo "Stop requested; exiting."
+    exit 130
+  fi
 
   if [[ $status -eq 0 ]]; then
     echo "Training finished cleanly."
