@@ -32,6 +32,8 @@ from onyx.model import (
     M3Optimizer,
     get_param_groups,
 )
+from onyx.experimental import OnyxMHC
+from onyx.fp32_utils import enforce_fp32_everywhere
 
 try:
     import wandb
@@ -244,6 +246,15 @@ class TrainingConfig:
     use_torch_compile: bool = False
     compile_mode: str = "reduce-overhead"
 
+    # === Experimental mHC ===
+    experimental_mhc: bool = False
+    mhc_n: int = 2
+    mhc_sinkhorn: bool = True
+    mhc_sinkhorn_iters: int = 10
+    mhc_mode: str = "mhc"
+    mhc_debug_finite_checks: bool = False
+    mhc_debug_every: int = 0
+
     # === Gradient ===
     gradient_clip: float = 1.0
 
@@ -282,6 +293,8 @@ class TrainingConfig:
     gc_collect_every: int = 200
     dataset_state_mode: str = "light"
     quiet: bool = False
+    mps_debug_memory: bool = False
+    mps_debug_steps: int = 3
 
 
 # =============================================================================
@@ -871,6 +884,73 @@ def _tree_map_tensors(obj: Any, fn):
     return obj
 
 
+def _assert_fp32_everywhere(module: nn.Module) -> None:
+    for name, param in module.named_parameters():
+        if param.is_floating_point() and param.dtype != torch.float32:
+            raise RuntimeError(f"Non-fp32 parameter: {name} ({param.dtype})")
+
+    for name, buf in module.named_buffers():
+        if buf is None:
+            continue
+        if buf.is_floating_point() and buf.dtype != torch.float32:
+            raise RuntimeError(f"Non-fp32 buffer: {name} ({buf.dtype})")
+
+
+def _assert_fp32_memory_states(obj: Any, path: str = "memory_states") -> None:
+    if torch.is_tensor(obj):
+        if obj.is_floating_point() and obj.dtype != torch.float32:
+            raise RuntimeError(f"Non-fp32 tensor at {path}: {obj.dtype}")
+        return
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            _assert_fp32_memory_states(value, f"{path}.{key}")
+        return
+    if isinstance(obj, list):
+        for idx, value in enumerate(obj):
+            _assert_fp32_memory_states(value, f"{path}[{idx}]")
+        return
+    if isinstance(obj, tuple):
+        for idx, value in enumerate(obj):
+            _assert_fp32_memory_states(value, f"{path}[{idx}]")
+        return
+
+
+def _tensor_stats(tensor: torch.Tensor) -> Dict[str, float]:
+    if tensor.numel() == 0:
+        return {"mean": float("nan"), "max": float("nan"), "min": float("nan")}
+    data = tensor.detach().float()
+    finite = torch.isfinite(data)
+    if finite.any():
+        data = data[finite]
+        return {
+            "mean": float(data.mean().item()),
+            "max": float(data.max().item()),
+            "min": float(data.min().item()),
+        }
+    return {"mean": float("nan"), "max": float("nan"), "min": float("nan")}
+
+
+def _tensor_finite_report(tensor: torch.Tensor) -> Dict[str, Any]:
+    x = tensor.detach()
+    nan = torch.isnan(x).sum().item()
+    inf = torch.isinf(x).sum().item()
+    total = x.numel()
+    finite_mask = torch.isfinite(x)
+    finite_count = finite_mask.sum().item()
+    rep = {
+        "nan": int(nan),
+        "inf": int(inf),
+        "finite": int(finite_count),
+        "total": int(total),
+    }
+    if finite_count > 0:
+        xf = x[finite_mask].float()
+        rep.update(mean=float(xf.mean().item()), max=float(xf.max().item()), min=float(xf.min().item()))
+    else:
+        rep.update(mean=float("nan"), max=float("nan"), min=float("nan"))
+    return rep
+
+
 # =============================================================================
 # Trainer
 # =============================================================================
@@ -900,6 +980,114 @@ class Trainer:
     def _handle_signal(self, signum, frame):
         self._log(f"\n[SIGNAL] Received {signum}, will save and exit after current step...", force=True)
         self._interrupt_requested = True
+
+    def _nan_tripwire(
+        self,
+        where: str,
+        *,
+        loss: Optional[torch.Tensor] = None,
+        logits: Optional[torch.Tensor] = None,
+        grad_norm: Optional[float] = None,
+        memory_states: Optional[Any] = None,
+        labels: Optional[torch.Tensor] = None,
+    ) -> None:
+        if memory_states is not None:
+            self.last_memory_states = memory_states
+
+        lrs = []
+        if hasattr(self, "optimizer"):
+            lrs = [pg.get("lr") for pg in self.optimizer.param_groups]
+        lr_str = ", ".join([f"{lr:.2e}" for lr in lrs if isinstance(lr, (float, int))]) if lrs else "n/a"
+        grad_norm_str = f"{grad_norm:.4e}" if isinstance(grad_norm, (float, int)) else "n/a"
+
+        self._log(
+            f"[NaN] {where} non-finite detected | step={self.global_step} | lr={lr_str} | grad_norm={grad_norm_str}",
+            force=True,
+        )
+
+        if loss is not None and torch.is_tensor(loss):
+            loss_val = float(loss.detach().float().cpu().item())
+            self._log(f"[NaN] loss={loss_val}", force=True)
+
+        if logits is not None and torch.is_tensor(logits):
+            rep = _tensor_finite_report(logits)
+            self._log(
+                "[NaN] logits report: "
+                f"nan={rep['nan']} inf={rep['inf']} finite={rep['finite']}/{rep['total']} "
+                f"mean={rep['mean']:.4e} max={rep['max']:.4e} min={rep['min']:.4e}",
+                force=True,
+            )
+
+        if labels is not None and torch.is_tensor(labels):
+            try:
+                flat = labels[:, 1:].contiguous().view(-1)
+                valid = flat != -100
+                valid_count = int(valid.sum().item())
+                if valid.any():
+                    lab_min = int(flat[valid].min().item())
+                    lab_max = int(flat[valid].max().item())
+                else:
+                    lab_min = -100
+                    lab_max = -100
+                self._log(
+                    f"[NaN] labels: valid={valid_count} min_valid={lab_min} max_valid={lab_max}",
+                    force=True,
+                )
+            except Exception as exc:
+                self._log(f"[NaN] labels report failed: {exc}", force=True)
+
+        model = self.model
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        mixers = getattr(model, "mixers", None)
+        if mixers is not None:
+            for idx, mixer in enumerate(mixers):
+                matrix = getattr(mixer, "matrix", None)
+                if matrix is None:
+                    continue
+                rep = _tensor_finite_report(matrix)
+                msg = (
+                    f"[NaN] mhc_mixer[{idx}] matrix report: "
+                    f"nan={rep['nan']} inf={rep['inf']} finite={rep['finite']}/{rep['total']} "
+                    f"mean={rep['mean']:.4e} max={rep['max']:.4e} min={rep['min']:.4e}"
+                )
+                try:
+                    with torch.no_grad():
+                        proj = mixer._mix_matrix()
+                    proj_rep = _tensor_finite_report(proj)
+                    msg += (
+                        " | proj report: "
+                        f"nan={proj_rep['nan']} inf={proj_rep['inf']} finite={proj_rep['finite']}/{proj_rep['total']} "
+                        f"mean={proj_rep['mean']:.4e} max={proj_rep['max']:.4e} min={proj_rep['min']:.4e}"
+                    )
+                except Exception as exc:
+                    msg += f" | proj_err={exc}"
+                used = getattr(mixer, "last_P_used", None)
+                if used is not None:
+                    used_rep = _tensor_finite_report(used)
+                    msg += (
+                        " | used report: "
+                        f"nan={used_rep['nan']} inf={used_rep['inf']} finite={used_rep['finite']}/{used_rep['total']} "
+                        f"mean={used_rep['mean']:.4e} max={used_rep['max']:.4e} min={used_rep['min']:.4e}"
+                    )
+                else:
+                    used_stats = getattr(mixer, "last_P_used_stats", None)
+                    if used_stats is not None:
+                        msg += (
+                            " | used report: "
+                            f"nan={used_stats['nan']} inf={used_stats['inf']} "
+                            f"finite={used_stats['finite']}/{used_stats['total']} "
+                            f"mean={used_stats['mean']:.4e} max={used_stats['max']:.4e} min={used_stats['min']:.4e}"
+                        )
+                self._log(msg, force=True)
+
+        try:
+            self.save_checkpoint(f"nan_step_{self.global_step}")
+            self._log(f"[NaN] Saved checkpoint: nan_step_{self.global_step}", force=True)
+        except Exception as exc:
+            self._log(f"[NaN] Failed to save checkpoint: {exc}", force=True)
+
+        raise RuntimeError(f"Non-finite detected at {where} (step {self.global_step}).")
 
     def _extract_vocab_size_from_ckpt(self, ckpt: Dict[str, Any]) -> Optional[int]:
         msd = ckpt.get("model_state_dict") or ckpt.get("model") or None
@@ -1044,6 +1232,8 @@ class Trainer:
         model_config.memory_reg_weight = cfg.memory_reg_weight
         model_config.use_flash_attention = (self.device_type == "cuda")
         model_config.gradient_checkpointing = cfg.gradient_checkpointing
+        model_config.mhc_debug_finite_checks = cfg.mhc_debug_finite_checks
+        model_config.mhc_debug_every = cfg.mhc_debug_every
 
         # Align vocab size (never shrink below any checkpoint vocab if provided)
         tok_vs = len(self.tokenizer)
@@ -1093,7 +1283,26 @@ class Trainer:
             )
         )
 
-        self.model = Onyx(model_config).to(self.device)
+        if cfg.experimental_mhc:
+            self._log(
+                "[Experimental] Using OnyxMHC mhc_n={n} mhc_mode={mode} sinkhorn={sinkhorn} iters={iters}".format(
+                    n=cfg.mhc_n,
+                    mode=cfg.mhc_mode,
+                    sinkhorn=cfg.mhc_sinkhorn,
+                    iters=cfg.mhc_sinkhorn_iters,
+                )
+            )
+            self.model = OnyxMHC(
+                model_config,
+                mhc_n=cfg.mhc_n,
+                mhc_mode=cfg.mhc_mode,
+                mhc_sinkhorn=cfg.mhc_sinkhorn,
+                mhc_sinkhorn_iters=cfg.mhc_sinkhorn_iters,
+            ).to(self.device)
+        else:
+            self.model = Onyx(model_config).to(self.device)
+        if not cfg.use_amp:
+            enforce_fp32_everywhere(self.model)
         try:
             tied = self.model.embed.weight.data_ptr() == self.model.lm_head.weight.data_ptr()
         except Exception:
@@ -1121,6 +1330,8 @@ class Trainer:
 
             self.model.load_state_dict(sd, strict=True)
             self._log("Init weights loaded.")
+            if not cfg.use_amp:
+                enforce_fp32_everywhere(self.model)
 
         # Dataset + loader
         self._log(f"Loading dataset from: {cfg.data_glob}")
@@ -1204,6 +1415,13 @@ class Trainer:
                 config={**vars(cfg), "device": str(self.device)},
             )
 
+        if not cfg.use_amp:
+            _assert_fp32_everywhere(self.model)
+            init_states = self.model.init_memory_states(cfg.batch_size, self.device, torch.float32)
+            _assert_fp32_memory_states(init_states)
+            if self._resume_memory_states_loaded and self.last_memory_states is not None:
+                _assert_fp32_memory_states(self.last_memory_states)
+
         if cfg.use_torch_compile and self.device_type == "cuda" and hasattr(torch, "compile"):
             self._log(f"Compiling model with mode: {cfg.compile_mode}")
             self.model = torch.compile(self.model, mode=cfg.compile_mode)
@@ -1235,6 +1453,12 @@ class Trainer:
     def train_step(self, memory_states=None):
         cfg = self.config
         self.model.train()
+        last_logits = None
+        mps_debug = (
+            cfg.mps_debug_memory
+            and self.device_type == "mps"
+            and (cfg.mps_debug_steps <= 0 or self.global_step < cfg.mps_debug_steps)
+        )
 
         if memory_states is None:
             memory_states = self.model.init_memory_states(
@@ -1248,7 +1472,7 @@ class Trainer:
         total_loss = 0.0
         total_tokens = 0
 
-        for _ in range(self.accumulation_steps):
+        for accum_idx in range(self.accumulation_steps):
             batch = self.get_batch()
             if batch is None:
                 break
@@ -1273,6 +1497,14 @@ class Trainer:
                 max_seqlen = int(batch["max_seqlen"].max().item()) if torch.is_tensor(batch["max_seqlen"]) else S
 
             memory_states = self.model.detach_memory_states(memory_states)
+
+            if cfg.mhc_debug_finite_checks:
+                model_for_step = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+                try:
+                    model_for_step.global_step = self.global_step
+                    model_for_step.global_micro_step = accum_idx
+                except Exception:
+                    pass
 
             if self.use_autocast and self.device_type == "cuda":
                 with torch.amp.autocast(device_type="cuda", dtype=self.autocast_dtype):
@@ -1307,7 +1539,19 @@ class Trainer:
                     max_seqlen=max_seqlen,
                 )
 
+            last_logits = out.get("logits")
             memory_states = out["memory_states"]
+            loss = out.get("loss")
+            if mps_debug:
+                self._log_mps_mem("after_forward", micro_step=accum_idx, micro_total=self.accumulation_steps)
+            if isinstance(loss, torch.Tensor) and not torch.isfinite(loss).all():
+                self._nan_tripwire(
+                    "loss",
+                    loss=loss,
+                    logits=last_logits,
+                    memory_states=memory_states,
+                    labels=labels,
+                )
 
             loss = out["loss"] / self.accumulation_steps
             mem_reg = out.get("memory_reg_loss", 0.0)
@@ -1320,6 +1564,8 @@ class Trainer:
                 self.scaler.scale(combined_loss).backward()
             else:
                 combined_loss.backward()
+            if mps_debug:
+                self._log_mps_mem("after_backward", micro_step=accum_idx, micro_total=self.accumulation_steps)
 
             total_loss += float(loss.item()) * self.accumulation_steps
 
@@ -1342,6 +1588,13 @@ class Trainer:
                 self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.gradient_clip)
             grad_norm_val = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+            if not math.isfinite(grad_norm_val):
+                self._nan_tripwire(
+                    "grad_norm",
+                    grad_norm=grad_norm_val,
+                    logits=last_logits,
+                    memory_states=memory_states,
+                )
         else:
             grad_norm_val = 0.0
 
@@ -1350,6 +1603,8 @@ class Trainer:
             self.scaler.update()
         else:
             self.optimizer.step()
+        if mps_debug:
+            self._log_mps_mem("after_step", micro_step=0, micro_total=1)
 
         self.global_step += 1
         self.tokens_seen += total_tokens
@@ -1393,6 +1648,20 @@ class Trainer:
             self._log(f"[WARN] Memory threshold exceeded: {', '.join(over)}", force=True)
             if cfg.auto_interrupt_on_mem:
                 self._interrupt_requested = True
+
+    def _log_mps_mem(self, msg: str, *, micro_step: Optional[int] = None, micro_total: Optional[int] = None) -> None:
+        if self.device_type != "mps" or not hasattr(torch, "mps"):
+            return
+        try:
+            cur = torch.mps.current_allocated_memory() / 1e9
+            drv = torch.mps.driver_allocated_memory() / 1e9
+        except Exception:
+            return
+        step = self.global_step
+        micro = ""
+        if micro_step is not None and micro_total is not None:
+            micro = f" micro={micro_step + 1}/{micro_total}"
+        self._log(f"[MPS] step={step}{micro} {msg} cur_gb={cur:.2f} drv_gb={drv:.2f}", force=True)
 
     def _maybe_cleanup(self) -> None:
         cfg = self.config
@@ -1608,6 +1877,9 @@ class Trainer:
             self._resize_vocab_tensor(sd, "lm_head.weight", model.lm_head.weight)
 
         model.load_state_dict(sd, strict=True)
+        if not self.config.use_amp:
+            enforce_fp32_everywhere(model)
+            _assert_fp32_everywhere(model)
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
         if self.scaler is not None and "scaler_state_dict" in ckpt:
@@ -1621,11 +1893,15 @@ class Trainer:
         self._pending_rng_state = ckpt.get("rng_state")
         mem_states = ckpt.get("memory_states")
         if mem_states is not None:
-            self.last_memory_states = _tree_map_tensors(
-                mem_states,
-                lambda t: t.to(self.device),
-            )
+            def _move_state(t: torch.Tensor) -> torch.Tensor:
+                if not self.config.use_amp and t.is_floating_point():
+                    return t.to(self.device, dtype=torch.float32)
+                return t.to(self.device)
+
+            self.last_memory_states = _tree_map_tensors(mem_states, _move_state)
             self._resume_memory_states_loaded = True
+            if not self.config.use_amp:
+                _assert_fp32_memory_states(self.last_memory_states)
         else:
             self.last_memory_states = None
             self._resume_memory_states_loaded = False
@@ -1744,6 +2020,13 @@ def _build_config_from_args(args: argparse.Namespace) -> TrainingConfig:
         amp_dtype=args.amp_dtype,
         amp_flag=args.amp,
         gradient_checkpointing=args.gradient_checkpointing,
+        experimental_mhc=args.experimental_mhc,
+        mhc_n=args.mhc_n,
+        mhc_sinkhorn=args.mhc_sinkhorn,
+        mhc_sinkhorn_iters=args.mhc_sinkhorn_iters,
+        mhc_mode=args.mhc_mode,
+        mhc_debug_finite_checks=args.mhc_debug_finite_checks,
+        mhc_debug_every=args.mhc_debug_every,
         bench_steps=args.bench_steps,
         disable_saves_during_bench=args.disable_saves_during_bench,
         save_dir=args.save_dir,
@@ -1768,7 +2051,14 @@ def _build_config_from_args(args: argparse.Namespace) -> TrainingConfig:
         gc_collect_every=args.gc_collect_every,
         dataset_state_mode=args.dataset_state_mode,
         quiet=args.quiet,
+        mps_debug_memory=args.mps_debug_memory,
+        mps_debug_steps=args.mps_debug_steps,
     )
+
+    if cfg.experimental_mhc:
+        base = os.path.basename(cfg.save_dir.rstrip(os.sep))
+        if "mhc" not in base.lower():
+            cfg.save_dir = os.path.join(cfg.save_dir, "mhc")
 
     if args.dry_run:
         cfg.max_steps = 3
@@ -1881,6 +2171,14 @@ def main():
     p.add_argument("--amp_dtype", type=str, choices=["float16", "bfloat16"], default="float16")
     p.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=False)
 
+    p.add_argument("--experimental_mhc", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--mhc_n", type=int, default=2)
+    p.add_argument("--mhc_sinkhorn", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mhc_sinkhorn_iters", type=int, default=10)
+    p.add_argument("--mhc_mode", type=str, choices=["mhc", "hc"], default="mhc")
+    p.add_argument("--mhc_debug_finite_checks", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--mhc_debug_every", type=int, default=0)
+
     p.add_argument("--bench_steps", type=int, default=0)
     p.add_argument("--disable_saves_during_bench", action="store_true")
 
@@ -1907,6 +2205,8 @@ def main():
     p.add_argument("--mps_empty_cache_every", type=int, default=50)
     p.add_argument("--gc_collect_every", type=int, default=200)
     p.add_argument("--quiet", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--mps_debug_memory", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--mps_debug_steps", type=int, default=3)
 
     p.add_argument("--dry_run", action="store_true")
     p.add_argument("--seed", type=int, default=42)

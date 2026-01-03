@@ -97,6 +97,10 @@ class OnyxConfig:
     m3_slow_freq: int = 50
     m3_slow_weight: float = 0.1
 
+    # === MHC Debug ===
+    mhc_debug_finite_checks: bool = False
+    mhc_debug_every: int = 0
+
 
 # =============================================================================
 # Basic Components
@@ -887,11 +891,22 @@ class Onyx(nn.Module):
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            flat_logits = shift_logits.view(-1, self.config.vocab_size)
+            flat_labels = shift_labels.view(-1)
+            valid = flat_labels != -100
+            if valid.any():
+                if not torch.isfinite(flat_logits[valid]).all():
+                    raise RuntimeError("Non-finite logits at valid label positions before cross_entropy")
+                per_tok = F.cross_entropy(
+                    flat_logits,
+                    flat_labels,
+                    ignore_index=-100,
+                    reduction="none",
+                )
+                denom = valid.sum().clamp(min=1)
+                loss = per_tok[valid].sum() / denom
+            else:
+                loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
         out = {
             "logits": logits,
@@ -980,13 +995,22 @@ class M3Optimizer(torch.optim.Optimizer):
             ns_steps = group["ns_steps"]
             wd = group["weight_decay"]
             use_nesterov = group["use_nesterov"]
+            mode = group.get("m3_mode", "auto")
+            force_vector = mode == "vector"
+            force_matrix = mode == "matrix"
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 
+                use_matrix = p.ndim == 2
+                if force_vector:
+                    use_matrix = False
+                elif force_matrix and p.ndim != 2:
+                    use_matrix = False
+
                 # --- 1. Vector/Embedding Logic (Standard SGD+Momentum) ---
-                if p.ndim != 2:
+                if not use_matrix:
                     g = p.grad
                     state = self.state[p]
                     if len(state) == 0:
@@ -1002,7 +1026,7 @@ class M3Optimizer(torch.optim.Optimizer):
                         
                     if wd != 0:
                         p.data.mul_(1 - lr * wd)
-                        
+
                     p.data.add_(update, alpha=-lr)
                     continue
 
@@ -1052,20 +1076,31 @@ def create_onyx(**kwargs) -> Onyx:
 
 
 def get_param_groups(model: Onyx, weight_decay: float = 0.1, memory_lr_scale: float = 0.1):
-    decay_params, no_decay_params, memory_params = [], [], []
+    decay_params, no_decay_params, memory_params, mixer_params = [], [], [], []
+    mixer_lr_scale = 0.05
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        if "mixers" in name:
+            mixer_params.append(param)
         # Check for dynamic projection layers
-        if any(k in name for k in ("eta_raw", "alpha_raw", "eta_proj", "alpha_proj")):
+        elif any(k in name for k in ("eta_raw", "alpha_raw", "eta_proj", "alpha_proj")):
             memory_params.append(param)
         elif "bias" in name or "norm" in name or "embed" in name:
             no_decay_params.append(param)
         else:
             decay_params.append(param)
 
-    return [
+    groups = [
         {"params": decay_params, "weight_decay": weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
         {"params": memory_params, "weight_decay": 0.0, "lr_scale": memory_lr_scale},
     ]
+    if mixer_params:
+        groups.append({
+            "params": mixer_params,
+            "weight_decay": 0.0,
+            "lr_scale": mixer_lr_scale,
+            "m3_mode": "vector",
+        })
+    return groups
