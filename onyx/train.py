@@ -18,6 +18,7 @@ import sys
 import time
 import resource
 from dataclasses import dataclass
+import copy
 from pathlib import Path
 from typing import Optional, Iterator, List, Dict, Any, Tuple, Union
 
@@ -233,10 +234,12 @@ class TrainingConfig:
     m3_slow_weight: float = 0.1
 
     # === Precision ===
-    use_amp: bool = True
+    use_amp: bool = False
     amp_dtype: str = "float16"
     amp_flag: Optional[bool] = None
 
+    # === Memory Savings ===
+    gradient_checkpointing: bool = False
     # === Compilation ===
     use_torch_compile: bool = False
     compile_mode: str = "reduce-overhead"
@@ -257,6 +260,7 @@ class TrainingConfig:
     resume: Optional[str] = None
     init_checkpoint: Optional[str] = None  # load weights only
     model_config_path: Optional[str] = None
+    stage_name: str = ""
 
     # === Logging ===
     log_every: int = 50
@@ -994,7 +998,10 @@ class Trainer:
             cfg.use_amp = False
 
         self.use_autocast = cfg.use_amp and self.device_type in ("cuda", "mps")
-        self._log(f"Autocast dtype: {self.autocast_dtype} | AMP: {cfg.use_amp}")
+        if cfg.use_amp:
+            self._log(f"Autocast dtype: {self.autocast_dtype} | AMP: {cfg.use_amp}")
+        else:
+            self._log("Using fp32 (AMP disabled)")
 
         if not TRANSFORMERS_AVAILABLE:
             raise RuntimeError("transformers not installed")
@@ -1020,30 +1027,23 @@ class Trainer:
             with open(cfg.model_config_path, "r") as f:
                 json_cfg = json.load(f)
             arch = json_cfg.get("architecture", json_cfg)
-            model_config = OnyxConfig(
-                d_model=arch.get("d_model", 384),
-                n_layers=arch.get("n_layers", 6),
-                n_heads=arch.get("n_heads", 6),
-                n_kv_heads=arch.get("n_kv_heads", 2),
-                d_ff=arch.get("d_ff", 4096),
-                vocab_size=arch.get("vocab_size", 128258),
-                max_seq_len=cfg.max_seq_len,
-                train_seq_len=cfg.max_seq_len,
-                rope_base=arch.get("rope_theta", arch.get("rope_base", 500000.0)),
-                norm_eps=arch.get("norm_eps", 1e-5),
-                use_flash_attention=(self.device_type == "cuda"),
-                gradient_checkpointing=(self.device_type == "cuda"),
-                memory_reg_weight=cfg.memory_reg_weight,
-            )
+            if not isinstance(arch, dict):
+                raise ValueError("model_config_path must contain a JSON object or an 'architecture' dict.")
+            arch = dict(arch)
+            if "rope_theta" in arch and "rope_base" not in arch:
+                # Back-compat: some configs use rope_theta.
+                arch["rope_base"] = arch.pop("rope_theta")
+            model_config = OnyxConfig(**arch)
         else:
             self._log("Creating Onyx model with default config...")
-            model_config = OnyxConfig(
-                use_flash_attention=(self.device_type == "cuda"),
-                gradient_checkpointing=(self.device_type == "cuda"),
-                memory_reg_weight=cfg.memory_reg_weight,
-                max_seq_len=cfg.max_seq_len,
-                train_seq_len=cfg.max_seq_len,
-            )
+            model_config = OnyxConfig()
+
+        # Runtime overrides (device/TrainingConfig-specific)
+        model_config.max_seq_len = cfg.max_seq_len
+        model_config.train_seq_len = cfg.max_seq_len
+        model_config.memory_reg_weight = cfg.memory_reg_weight
+        model_config.use_flash_attention = (self.device_type == "cuda")
+        model_config.gradient_checkpointing = cfg.gradient_checkpointing
 
         # Align vocab size (never shrink below any checkpoint vocab if provided)
         tok_vs = len(self.tokenizer)
@@ -1053,7 +1053,58 @@ class Trainer:
             self._log(f"Adjusting model vocab_size from {model_config.vocab_size} to {target_vs} to match tokenizer/checkpoint.")
             model_config.vocab_size = target_vs
 
+        dtype_mode = "fp32 (AMP disabled)" if not cfg.use_amp else f"amp({self.autocast_dtype})"
+        self._log(f"[Config] device_type={self.device_type} | dtype_mode={dtype_mode}")
+        self._log(
+            "[Config] d_model={d_model} n_layers={n_layers} n_heads={n_heads} "
+            "n_kv_heads={n_kv_heads} d_ff={d_ff}".format(
+                d_model=model_config.d_model,
+                n_layers=model_config.n_layers,
+                n_heads=model_config.n_heads,
+                n_kv_heads=model_config.n_kv_heads,
+                d_ff=model_config.d_ff,
+            )
+        )
+        self._log(
+            "[Toggles] tie_embeddings={tie} use_hope_attention={hope} "
+            "use_cms_ffn={cms} cms_num_levels={cms_levels} "
+            "use_short_conv={short_conv} memory_chunk_size={mem_chunk} "
+            "gradient_checkpointing={grad_ckpt}".format(
+                tie=model_config.tie_embeddings,
+                hope=model_config.use_hope_attention,
+                cms=model_config.use_cms_ffn,
+                cms_levels=model_config.cms_num_levels,
+                short_conv=model_config.use_short_conv,
+                mem_chunk=model_config.memory_chunk_size,
+                grad_ckpt=model_config.gradient_checkpointing,
+            )
+        )
+        self._log(
+            "[Vocab] tokenizer_len={tok} ckpt_vocab={ckpt} model_vocab={model}".format(
+                tok=tok_vs,
+                ckpt=ckpt_vs,
+                model=model_config.vocab_size,
+            )
+        )
+        self._log(
+            "[Seq] cfg.max_seq_len={cfg_len} model.max_seq_len={model_len}".format(
+                cfg_len=cfg.max_seq_len,
+                model_len=model_config.max_seq_len,
+            )
+        )
+
         self.model = Onyx(model_config).to(self.device)
+        try:
+            tied = self.model.embed.weight.data_ptr() == self.model.lm_head.weight.data_ptr()
+        except Exception:
+            tied = False
+        self._log(
+            "[Tied] embed.shape={embed_shape} lm_head.shape={lm_shape} tied={tied}".format(
+                embed_shape=tuple(self.model.embed.weight.shape),
+                lm_shape=tuple(self.model.lm_head.weight.shape),
+                tied=tied,
+            )
+        )
 
         # Load weights from init_checkpoint (weights only)
         if cfg.init_checkpoint:
@@ -1504,6 +1555,9 @@ class Trainer:
         cfg = self.config
         os.makedirs(cfg.save_dir, exist_ok=True)
 
+        if cfg.stage_name:
+            # Prefix stage name for progressive sequence schedules.
+            name = f"{cfg.stage_name}_{name}"
         path = os.path.join(cfg.save_dir, f"checkpoint_{name}.pt")
         tmp_path = path + ".tmp"
 
@@ -1621,17 +1675,17 @@ class Trainer:
             return
 
         # Only manage step checkpoints; keep "final"/"epoch"/"interrupt" etc.
-        step_ckpts = sorted(Path(cfg.save_dir).glob("checkpoint_step_*.pt"))
+        ckpt_dir = Path(cfg.save_dir)
+        step_ckpts = list(ckpt_dir.glob("checkpoint_step_*.pt"))
+        step_ckpts += list(ckpt_dir.glob("checkpoint_*_step_*.pt"))
+        step_ckpts = sorted(set(step_ckpts))
         if len(step_ckpts) <= cfg.keep_last_n:
             return
 
         def _step_num(p: Path) -> Optional[int]:
-            # checkpoint_step_12345.pt
-            s = p.stem
-            try:
-                return int(s.split("_")[-1])
-            except Exception:
-                return None
+            # checkpoint_<prefix>_step_12345.pt
+            m = re.search(r"_step_(\d+)$", p.stem)
+            return int(m.group(1)) if m else None
 
         keep: set[Path] = set()
 
@@ -1659,6 +1713,129 @@ class Trainer:
 # =============================================================================
 # Main
 # =============================================================================
+
+def _build_config_from_args(args: argparse.Namespace) -> TrainingConfig:
+    amp_default = TrainingConfig.__dataclass_fields__["use_amp"].default
+    use_amp = args.amp if args.amp is not None else amp_default
+
+    cfg = TrainingConfig(
+        data_glob=args.data_glob,
+        tokenizer_name=args.tokenizer,
+        model_config_path=args.model_config,
+        batch_size=args.batch_size,
+        max_seq_len=args.max_seq_len,
+        tokens_per_step=args.tokens_per_step,
+        pack_sequences=args.pack_sequences,
+        drop_remainder=args.drop_remainder,
+        shuffle_buffer_docs=args.shuffle_buffer_docs,
+        num_epochs=args.num_epochs,
+        train_tokens_target=args.train_tokens_target,
+        max_steps=args.max_steps,
+        learning_rate=args.learning_rate,
+        min_lr=args.min_lr,
+        memory_lr_scale=args.memory_lr_scale,
+        warmup_steps=args.warmup_steps,
+        warmup_ratio=args.warmup_ratio,
+        weight_decay=args.weight_decay,
+        use_m3_optimizer=(not args.use_adamw),
+        use_torch_compile=args.compile,
+        compile_mode=args.compile_mode,
+        use_amp=use_amp,
+        amp_dtype=args.amp_dtype,
+        amp_flag=args.amp,
+        gradient_checkpointing=args.gradient_checkpointing,
+        bench_steps=args.bench_steps,
+        disable_saves_during_bench=args.disable_saves_during_bench,
+        save_dir=args.save_dir,
+        save_every_steps=args.save_every_steps,
+        keep_last_n=args.keep_last_n,
+        keep_every_steps=args.keep_every_steps,
+        resume=args.resume,
+        init_checkpoint=args.init_checkpoint,
+        log_every=args.log_every,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        dry_run=args.dry_run,
+        seed=args.seed,
+        log_file=args.log_file,
+        tee=args.tee,
+        flush_logs=args.flush_logs,
+        mem_report_every=args.mem_report_every,
+        max_rss_gb=args.max_rss_gb,
+        max_mps_alloc_gb=args.max_mps_alloc_gb,
+        auto_interrupt_on_mem=args.auto_interrupt_on_mem,
+        mps_empty_cache_every=args.mps_empty_cache_every,
+        gc_collect_every=args.gc_collect_every,
+        dataset_state_mode=args.dataset_state_mode,
+        quiet=args.quiet,
+    )
+
+    if args.dry_run:
+        cfg.max_steps = 3
+        cfg.log_every = 1
+        cfg.save_every_steps = 0
+        cfg.use_torch_compile = False
+        cfg.wandb_project = None
+        log("\nDRY RUN MODE (3 steps)\n")
+
+    return cfg
+
+
+def _load_schedule(path: str) -> List[Dict[str, Any]]:
+    with open(path, "r") as f:
+        data = json.load(f)
+    if not isinstance(data, list) or not data:
+        raise ValueError("schedule_json must be a non-empty list of stage configs.")
+    return data
+
+
+def _find_latest_checkpoint(ckpt_dir: str, pattern: str = "checkpoint_*_step_*.pt") -> Optional[str]:
+    paths = list(Path(ckpt_dir).glob(pattern))
+    if not paths:
+        return None
+
+    def _step_num(p: Path) -> int:
+        m = re.search(r"_step_(\d+)", p.stem)
+        return int(m.group(1)) if m else -1
+
+    paths.sort(key=lambda p: (_step_num(p), p.stat().st_mtime), reverse=True)
+    return str(paths[0])
+
+
+def _apply_stage_overrides(cfg: TrainingConfig, stage: Dict[str, Any]) -> None:
+    for key, value in stage.items():
+        if key in ("name", "resume"):
+            continue
+        if key in TrainingConfig.__dataclass_fields__:
+            setattr(cfg, key, value)
+        else:
+            log(f"[WARN] Unknown stage override ignored: {key}")
+
+
+def _run_schedule(args: argparse.Namespace) -> None:
+    stages = _load_schedule(args.schedule_json)
+    base_cfg = _build_config_from_args(args)
+    last_stage_name: Optional[str] = None
+
+    for idx, stage in enumerate(stages):
+        cfg = copy.deepcopy(base_cfg)
+        _apply_stage_overrides(cfg, stage)
+        stage_name = stage.get("name") or f"stage{idx}_len{cfg.max_seq_len}"
+        cfg.stage_name = stage_name
+
+        if "resume" in stage:
+            cfg.resume = stage["resume"]
+        elif idx > 0 and args.resume_stage_from_last:
+            pattern = f"checkpoint_{last_stage_name}_step_*.pt" if last_stage_name else "checkpoint_*_step_*.pt"
+            cfg.resume = _find_latest_checkpoint(cfg.save_dir, pattern=pattern)
+            if cfg.resume is None and last_stage_name:
+                cfg.resume = _find_latest_checkpoint(cfg.save_dir)
+
+        print(f"\n=== Running {stage_name} ===")
+        if cfg.resume:
+            print(f"Resume: {cfg.resume}")
+        Trainer(cfg).train()
+        last_stage_name = stage_name
 
 def main():
     p = argparse.ArgumentParser(
@@ -1700,8 +1877,9 @@ def main():
     p.add_argument("--compile", action="store_true")
     p.add_argument("--compile_mode", type=str, default="reduce-overhead")
 
-    p.add_argument("--amp", action="store_true", default=None)
+    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--amp_dtype", type=str, choices=["float16", "bfloat16"], default="float16")
+    p.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=False)
 
     p.add_argument("--bench_steps", type=int, default=0)
     p.add_argument("--disable_saves_during_bench", action="store_true")
@@ -1732,74 +1910,17 @@ def main():
 
     p.add_argument("--dry_run", action="store_true")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--schedule_json", type=str, default=None, help="JSON list of stage overrides for progressive seq-len training.")
+    p.add_argument("--resume_stage_from_last", action=argparse.BooleanOptionalAction, default=True, help="Auto-resume each stage from latest checkpoint.")
 
     args = p.parse_args()
 
-    # AMP default behavior
-    amp_default = TrainingConfig.__dataclass_fields__["use_amp"].default
-    use_amp = args.amp if args.amp is not None else amp_default
+    if args.schedule_json:
+        _run_schedule(args)
+        return
 
-    cfg = TrainingConfig(
-        data_glob=args.data_glob,
-        tokenizer_name=args.tokenizer,
-        model_config_path=args.model_config,
-        batch_size=args.batch_size,
-        max_seq_len=args.max_seq_len,
-        tokens_per_step=args.tokens_per_step,
-        pack_sequences=args.pack_sequences,
-        drop_remainder=args.drop_remainder,
-        shuffle_buffer_docs=args.shuffle_buffer_docs,
-        num_epochs=args.num_epochs,
-        train_tokens_target=args.train_tokens_target,
-        max_steps=args.max_steps,
-        learning_rate=args.learning_rate,
-        min_lr=args.min_lr,
-        memory_lr_scale=args.memory_lr_scale,
-        warmup_steps=args.warmup_steps,
-        warmup_ratio=args.warmup_ratio,
-        weight_decay=args.weight_decay,
-        use_m3_optimizer=(not args.use_adamw),
-        use_torch_compile=args.compile,
-        compile_mode=args.compile_mode,
-        use_amp=use_amp,
-        amp_dtype=args.amp_dtype,
-        amp_flag=args.amp,
-        bench_steps=args.bench_steps,
-        disable_saves_during_bench=args.disable_saves_during_bench,
-        save_dir=args.save_dir,
-        save_every_steps=args.save_every_steps,
-        keep_last_n=args.keep_last_n,
-        keep_every_steps=args.keep_every_steps,
-        resume=args.resume,
-        init_checkpoint=args.init_checkpoint,
-        log_every=args.log_every,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
-        dry_run=args.dry_run,
-        seed=args.seed,
-        log_file=args.log_file,
-        tee=args.tee,
-        flush_logs=args.flush_logs,
-        mem_report_every=args.mem_report_every,
-        max_rss_gb=args.max_rss_gb,
-        max_mps_alloc_gb=args.max_mps_alloc_gb,
-        auto_interrupt_on_mem=args.auto_interrupt_on_mem,
-        mps_empty_cache_every=args.mps_empty_cache_every,
-        gc_collect_every=args.gc_collect_every,
-        dataset_state_mode=args.dataset_state_mode,
-        quiet=args.quiet,
-    )
-
+    cfg = _build_config_from_args(args)
     _configure_logger(cfg.log_file, cfg.tee, cfg.flush_logs)
-
-    if args.dry_run:
-        cfg.max_steps = 3
-        cfg.log_every = 1
-        cfg.save_every_steps = 0
-        cfg.use_torch_compile = False
-        cfg.wandb_project = None
-        log("\nDRY RUN MODE (3 steps)\n")
-
     Trainer(cfg).train()
 
 

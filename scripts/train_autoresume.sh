@@ -7,10 +7,13 @@ if [[ -z "${CAFFEINATED:-}" ]]; then
   exec caffeinate -dimsu -- "$0" "$@"
 fi
 
-CKPT_DIR="/Users/owner/Desktop/caiatech/models/onyx/checkpoints"
+BASE_DIR="/Users/owner/Desktop/caiatech/models/onyx"
+CKPT_DIR="${BASE_DIR}/checkpoints"
+LOG_DIR="${BASE_DIR}/logs"
 LOCK_DIR="${CKPT_DIR}/.train_autoresume.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 
+mkdir -p "$CKPT_DIR" "$LOG_DIR"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   if [[ -f "$LOCK_PID_FILE" ]]; then
     existing_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null || true)
@@ -44,7 +47,7 @@ BASE_CMD=(
   --warmup_ratio 0.04
   --save_dir "/Users/owner/Desktop/caiatech/models/onyx/checkpoints"
   --save_every_steps 100
-  --train_tokens_target 849327647
+  --train_tokens_target 718655137
   --log_every 50
   --log_file "/Users/owner/Desktop/caiatech/models/onyx/logs/onyx_42m_train.log"
   --mem_report_every 50
