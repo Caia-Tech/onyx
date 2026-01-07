@@ -9,3 +9,5 @@ Do whatever you want
 ## Author
 
 Marvin Tutt, Caia Tech
+
+Safety SFT: https://github.com/Caia-Tech/caia-ai-safety
