@@ -1,0 +1,13 @@
+{
+  "architecture": {
+    "d_model": 640,
+    "n_layers": 9,
+    "n_heads": 10,
+    "n_kv_heads": 2,
+    "d_ff": 2560,
+    "vocab_size": 32768,
+    "max_seq_len": 1024,
+    "rope_base": 500000.0,
+    "norm_eps": 1e-05
+  }
+}

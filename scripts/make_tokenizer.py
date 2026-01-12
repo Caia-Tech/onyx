@@ -27,7 +27,7 @@ def iter_jsonl_texts(path: str) -> Iterator[str]:
                 yield text
                 continue
 
-            # Chat-shaped records like your dataset supports
+            # Single-turn chat: {"user": "...", "assistant": "..."}
             user = obj.get("user")
             assistant = obj.get("assistant")
             system = obj.get("system", "")
@@ -40,6 +40,23 @@ def iter_jsonl_texts(path: str) -> Iterator[str]:
                     yield f"System: {system}\n\nUser: {user}\nAssistant: {assistant}"
                 else:
                     yield f"User: {user}\nAssistant: {assistant}"
+                continue
+
+            # Multi-turn chat: {"chat": [{"user": "...", "assistant": "..."}, ...]}
+            chat = obj.get("chat")
+            if isinstance(chat, list):
+                parts = []
+                for turn in chat:
+                    if not isinstance(turn, dict):
+                        continue
+                    u = turn.get("user")
+                    a = turn.get("assistant")
+                    if isinstance(u, str) and u.strip():
+                        parts.append(f"User: {u.strip()}")
+                    if isinstance(a, str) and a.strip():
+                        parts.append(f"Assistant: {a.strip()}")
+                if parts:
+                    yield "\n".join(parts)
 
 
 def iter_corpus(data_glob: str) -> Iterator[str]:
