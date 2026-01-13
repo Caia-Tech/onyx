@@ -85,6 +85,11 @@ class OnyxConfig:
     # === Memory Regularization ===
     memory_reg_weight: float = 0.0001
 
+    # === Loss & Regularization ===
+    label_smoothing: float = 0.0  # 0.0 = disabled, 0.1 = recommended for mode collapse
+    entropy_reg_weight: float = 0.0  # 0.0 = disabled, 0.01 = encourages diverse predictions
+    feedback_strength: float = 1.0  # 1.0 = full feedback loop, 0.5 = dampened, 0.0 = no feedback
+
     # === CMS FFN ===
     use_cms_ffn: bool = True
     cms_num_levels: int = 4
@@ -363,7 +368,10 @@ class ChunkedSelfReferentialMemory(nn.Module):
         def target_gen_fn(retrieved_vals):
             if self.value_gen is not None:
                 base = value_input if value_input is not None else retrieved_vals
-                return self.value_gen(base) + base
+                transformed = self.value_gen(base)
+                # Apply feedback_strength to control loop intensity
+                strength = self.config.feedback_strength
+                return base + strength * transformed
             return retrieved_vals
 
         outputs, M_new = self.memory(
@@ -897,14 +905,38 @@ class Onyx(nn.Module):
             if valid.any():
                 if not torch.isfinite(flat_logits[valid]).all():
                     raise RuntimeError("Non-finite logits at valid label positions before cross_entropy")
-                per_tok = F.cross_entropy(
-                    flat_logits,
-                    flat_labels,
-                    ignore_index=-100,
-                    reduction="none",
-                )
+
+                # Apply label smoothing if configured
+                if self.config.label_smoothing > 0.0:
+                    smoothing = self.config.label_smoothing
+                    vocab_size = self.config.vocab_size
+                    # Compute log probabilities
+                    log_probs = F.log_softmax(flat_logits, dim=-1)
+                    # Standard cross-entropy component
+                    nll = -log_probs.gather(dim=-1, index=flat_labels.unsqueeze(1)).squeeze(1)
+                    # Smoothing component (uniform over vocab)
+                    smooth_loss = -log_probs.mean(dim=-1)
+                    # Combine: (1-smoothing)*nll + smoothing*smooth_loss
+                    per_tok = (1.0 - smoothing) * nll + smoothing * smooth_loss
+                else:
+                    # Standard cross-entropy (no smoothing)
+                    per_tok = F.cross_entropy(
+                        flat_logits,
+                        flat_labels,
+                        ignore_index=-100,
+                        reduction="none",
+                    )
                 denom = valid.sum().clamp(min=1)
                 loss = per_tok[valid].sum() / denom
+
+                # Add entropy regularization if configured (encourages diverse predictions)
+                if self.config.entropy_reg_weight > 0.0:
+                    # Compute entropy: -sum(p * log(p))
+                    probs = F.softmax(flat_logits[valid], dim=-1)
+                    log_probs = F.log_softmax(flat_logits[valid], dim=-1)
+                    entropy = -(probs * log_probs).sum(dim=-1).mean()
+                    # Subtract entropy (we want to maximize it, i.e., minimize negative entropy)
+                    loss = loss - self.config.entropy_reg_weight * entropy
             else:
                 loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
 

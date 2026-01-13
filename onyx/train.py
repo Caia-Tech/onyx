@@ -229,6 +229,20 @@ class TrainingConfig:
     # === Memory ===
     memory_reg_weight: float = 0.0001
 
+    # === Loss & Regularization ===
+    label_smoothing: float = 0.0
+    entropy_reg_weight: float = 0.0
+    feedback_strength: float = 1.0
+
+    # === Monitoring ===
+    monitor_diversity: bool = True
+    monitor_memory_states: bool = False
+    monitor_every: int = 0  # 0 = use log_every
+    alert_top10_mass: float = 0.7
+    alert_entropy_ratio: float = 0.3
+    alert_effective_vocab: int = 100
+    alert_memory_norm: float = 100.0
+
     # === Optimizer ===
     use_m3_optimizer: bool = True
     m3_beta_slow: float = 0.99
@@ -972,6 +986,10 @@ class Trainer:
         self._resume_memory_states_loaded = False
         self._logger_configured = False
 
+        # Initialize monitors to None (will be set in setup() if enabled)
+        self.diversity_monitor: Optional[Any] = None
+        self.memory_monitor: Optional[Any] = None
+
     def _log(self, msg: str, *, force: bool = False) -> None:
         if not force and getattr(self.config, "quiet", False):
             return
@@ -1230,6 +1248,9 @@ class Trainer:
         model_config.max_seq_len = cfg.max_seq_len
         model_config.train_seq_len = cfg.max_seq_len
         model_config.memory_reg_weight = cfg.memory_reg_weight
+        model_config.label_smoothing = cfg.label_smoothing
+        model_config.entropy_reg_weight = cfg.entropy_reg_weight
+        model_config.feedback_strength = cfg.feedback_strength
         model_config.use_flash_attention = (self.device_type == "cuda")
         model_config.gradient_checkpointing = cfg.gradient_checkpointing
         model_config.mhc_debug_finite_checks = cfg.mhc_debug_finite_checks
@@ -1426,6 +1447,33 @@ class Trainer:
             self._log(f"Compiling model with mode: {cfg.compile_mode}")
             self.model = torch.compile(self.model, mode=cfg.compile_mode)
 
+        # Initialize monitoring
+        monitor_freq = cfg.monitor_every if cfg.monitor_every > 0 else cfg.log_every
+        if cfg.monitor_diversity:
+            from onyx.monitoring import DiversityMonitor
+            self.diversity_monitor = DiversityMonitor(
+                vocab_size=model_config.vocab_size,
+                monitor_every=monitor_freq,
+                alert_top10_mass=cfg.alert_top10_mass,
+                alert_entropy_ratio=cfg.alert_entropy_ratio,
+                alert_effective_vocab=cfg.alert_effective_vocab,
+                tokenizer=self.tokenizer,
+            )
+            self._log(f"Diversity monitoring enabled (every {monitor_freq} steps)")
+        else:
+            self.diversity_monitor = None
+
+        if cfg.monitor_memory_states:
+            from onyx.monitoring import MemoryMonitor
+            self.memory_monitor = MemoryMonitor(
+                num_layers=model_config.n_layers,
+                monitor_every=monitor_freq,
+                alert_norm_threshold=cfg.alert_memory_norm,
+            )
+            self._log(f"Memory state monitoring enabled (every {monitor_freq} steps)")
+        else:
+            self.memory_monitor = None
+
         self._log("\nSetup complete!\n")
 
     def get_batch(self) -> Optional[Dict[str, Any]]:
@@ -1573,6 +1621,44 @@ class Trainer:
             return None, memory_states
 
         self.last_memory_states = memory_states
+
+        # === Monitoring ===
+        # Token diversity monitoring
+        if self.diversity_monitor and last_logits is not None:
+            div_metrics = self.diversity_monitor.compute_metrics(last_logits, self.global_step)
+            if div_metrics:
+                # Log to wandb if available
+                if cfg.wandb_project and WANDB_AVAILABLE:
+                    wandb.log({
+                        "diversity/top10_mass": div_metrics["top10_mass"],
+                        "diversity/top50_mass": div_metrics["top50_mass"],
+                        "diversity/top100_mass": div_metrics["top100_mass"],
+                        "diversity/entropy": div_metrics["entropy"],
+                        "diversity/entropy_ratio": div_metrics["entropy_ratio"],
+                        "diversity/effective_vocab": div_metrics["effective_vocab"],
+                    }, step=self.global_step)
+
+                # Check for alerts
+                warnings = self.diversity_monitor.check_alerts(div_metrics, self.global_step)
+                for warning in warnings:
+                    self._log(warning, force=True)
+
+        # Memory state monitoring (optional)
+        if self.memory_monitor and memory_states is not None:
+            mem_metrics = self.memory_monitor.compute_metrics(memory_states, self.global_step)
+            if mem_metrics:
+                # Log to wandb if available
+                if cfg.wandb_project and WANDB_AVAILABLE:
+                    for layer_idx, norm in enumerate(mem_metrics["norms"]):
+                        wandb.log({f"memory/layer_{layer_idx}_norm": norm}, step=self.global_step)
+                    for layer_idx, update_mag in enumerate(mem_metrics["update_mags"]):
+                        if update_mag > 0:  # Skip first measurement (no previous state)
+                            wandb.log({f"memory/layer_{layer_idx}_update_mag": update_mag}, step=self.global_step)
+
+                # Check for alerts
+                mem_warnings = self.memory_monitor.check_alerts(mem_metrics, self.global_step)
+                for warning in mem_warnings:
+                    self._log(warning, force=True)
 
         if not hasattr(self, "_cms_manager"):
             self._cms_manager = None
