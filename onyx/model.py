@@ -1108,31 +1108,40 @@ def create_onyx(**kwargs) -> Onyx:
 
 
 def get_param_groups(model: Onyx, weight_decay: float = 0.1, memory_lr_scale: float = 0.1):
-    decay_params, no_decay_params, memory_params, mixer_params = [], [], [], []
-    mixer_lr_scale = 0.05
+    decay_params, no_decay_params, memory_params = [], [], []
+    embed_params = []
+    seen = set()
+
+    def add_unique(lst, p):
+        pid = id(p)
+        if pid in seen:
+            return
+        seen.add(pid)
+        lst.append(p)
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "mixers" in name:
-            mixer_params.append(param)
-        # Check for dynamic projection layers
-        elif any(k in name for k in ("eta_raw", "alpha_raw", "eta_proj", "alpha_proj")):
-            memory_params.append(param)
-        elif "bias" in name or "norm" in name or "embed" in name:
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
+
+        if "embed" in name or "lm_head" in name:
+            add_unique(embed_params, param)
+            continue
+
+        if any(k in name for k in ("eta_proj", "alpha_proj", "gate_proj")):
+            add_unique(memory_params, param)
+            continue
+
+        if "bias" in name or "norm" in name:
+            add_unique(no_decay_params, param)
+            continue
+
+        add_unique(decay_params, param)
 
     groups = [
         {"params": decay_params, "weight_decay": weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
         {"params": memory_params, "weight_decay": 0.0, "lr_scale": memory_lr_scale},
     ]
-    if mixer_params:
-        groups.append({
-            "params": mixer_params,
-            "weight_decay": 0.0,
-            "lr_scale": mixer_lr_scale,
-            "m3_mode": "vector",
-        })
+    if embed_params:
+        groups.append({"params": embed_params, "weight_decay": 0.0, "m3_mode": "vector"})
     return groups

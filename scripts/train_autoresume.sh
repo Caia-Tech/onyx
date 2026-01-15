@@ -8,7 +8,7 @@ if [[ -z "${CAFFEINATED:-}" ]]; then
 fi
 
 BASE_DIR="/Users/owner/Desktop/caiatech/models/onyx"
-CKPT_DIR="${BASE_DIR}/checkpoints"
+CKPT_DIR="${BASE_DIR}/checkpoints_mhc"
 LOG_DIR="${BASE_DIR}/logs"
 LOCK_DIR="${CKPT_DIR}/.train_autoresume.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
@@ -37,26 +37,30 @@ trap cleanup_lock EXIT
 
 BASE_CMD=(
   python -m onyx.train
-  --data_glob "/Users/owner/Desktop/caiatech/datasets/caia-chat.jsonl"
-  --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizers/test_32k"
-  --model_config "/Users/owner/Desktop/caiatech/models/onyx/configs/onyx_42m.json"
-  --batch_size 1
-  --max_seq_len 4096
-  --tokens_per_step 16384
+  --data_glob "/Users/owner/Desktop/caiatech/datasets/onyx-dataset.jsonl"
+  --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizers/onyx-tokenizer"
+  --model_config "/Users/owner/Desktop/caiatech/models/onyx/configs/onyx_22m.json"
+  --batch_size 8
+  --max_seq_len 256
+  --tokens_per_step 8192
   --num_epochs 1
-  --warmup_ratio 0.04
-  --save_dir "/Users/owner/Desktop/caiatech/models/onyx/checkpoints"
-  --save_every_steps 100
-  --train_tokens_target 718655137
-  --log_every 50
-  --log_file "/Users/owner/Desktop/caiatech/models/onyx/logs/onyx_42m_train.log"
-  --mem_report_every 50
-  --mps_empty_cache_every 50
+  --warmup_ratio 0.005
+  --save_dir "/Users/owner/Desktop/caiatech/models/onyx/checkpoints_mhc"
+  --save_every_steps 1000
+  --train_tokens_target 3146456434
+  --log_every 1000
+  --log_file "/Users/owner/Desktop/caiatech/models/onyx/logs/onyx_22m_mhc_train.log"
+  --mem_report_every 1000
+  --mps_empty_cache_every 100
   --gc_collect_every 200
   --max_rss_gb 10
   --max_mps_alloc_gb 14
   --auto_interrupt_on_mem
   --dataset_state_mode light
+  --experimental_mhc
+  --mhc_n 2
+  --mhc_mode mhc
+  --mhc_sinkhorn_iters 10
 )
 
 RETRY_DELAY_SEC=5
@@ -109,6 +113,7 @@ while true; do
 
   start_ts=$(date +%s)
   echo "Starting: ${CMD[*]}"
+  cd "$BASE_DIR"
   "${CMD[@]}" &
   child_pid=$!
   wait "$child_pid"

@@ -220,7 +220,7 @@ class TrainingConfig:
 
     # === Learning Rate ===
     learning_rate: float = 3e-4
-    min_lr: float = 3e-5
+    min_lr: float = 1e-5
     memory_lr_scale: float = 0.1
     warmup_steps: int = 50
     warmup_ratio: Optional[float] = None
@@ -1842,7 +1842,7 @@ class Trainer:
                 f"dataset_state_loaded={self._resume_dataset_state_loaded}"
             )
 
-        memory_states = self.last_memory_states if self.last_memory_states is not None else None
+        # Reset memory every optimizer step (do NOT carry across steps)
         start_time = time.time()
         log_loss = 0.0
         log_tokens = 0
@@ -1858,7 +1858,8 @@ class Trainer:
             lr = get_lr(self.global_step, cfg, total_steps)
             set_lr(self.optimizer, lr)
 
-            metrics, memory_states = self.train_step(memory_states)
+            # KEY CHANGE: always reset memory per optimizer step
+            metrics, _ = self.train_step(memory_states=None)
             if metrics is None:
                 continue
 
@@ -2242,7 +2243,7 @@ def main():
     p.add_argument("--max_steps", type=int, default=None)
 
     p.add_argument("--learning_rate", type=float, default=3e-4)
-    p.add_argument("--min_lr", type=float, default=3e-5)
+    p.add_argument("--min_lr", type=float, default=1e-5)
     p.add_argument("--memory_lr_scale", type=float, default=0.1)
     p.add_argument("--warmup_steps", type=int, default=50)
     p.add_argument("--warmup_ratio", type=float, default=None, help="Override warmup_steps as ratio of total_steps.")
