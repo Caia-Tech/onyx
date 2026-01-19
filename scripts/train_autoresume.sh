@@ -38,20 +38,20 @@ trap cleanup_lock EXIT
 BASE_CMD=(
   python -m onyx.train
   --data_glob "/Users/owner/Desktop/caiatech/datasets/onyx-dataset.jsonl"
-  --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizers/onyx-tokenizer"
-  --model_config "/Users/owner/Desktop/caiatech/models/onyx/configs/onyx_22m.json"
-  --batch_size 8
-  --max_seq_len 256
+  --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizer"
+  --model_config "/Users/owner/Desktop/caiatech/models/onyx/configs/onyx_1m.json"
+  --batch_size 4
+  --max_seq_len 512
   --tokens_per_step 8192
   --num_epochs 1
   --warmup_ratio 0.005
   --save_dir "/Users/owner/Desktop/caiatech/models/onyx/checkpoints_mhc"
-  --save_every_steps 1000
+  --save_every_steps 5000
   --train_tokens_target 3146456434
   --log_every 1000
-  --log_file "/Users/owner/Desktop/caiatech/models/onyx/logs/onyx_22m_mhc_train.log"
+  --log_file "/Users/owner/Desktop/caiatech/models/onyx/logs/onyx_1m_mhc_train.log"
   --mem_report_every 1000
-  --mps_empty_cache_every 100
+  --mps_empty_cache_every 1000
   --gc_collect_every 200
   --max_rss_gb 10
   --max_mps_alloc_gb 14
