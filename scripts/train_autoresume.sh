@@ -8,7 +8,8 @@ if [[ -z "${CAFFEINATED:-}" ]]; then
 fi
 
 BASE_DIR="/Users/owner/Desktop/caiatech/models/onyx"
-CKPT_DIR="${BASE_DIR}/checkpoints_mhc"
+CKPT_DIR="${BASE_DIR}/checkpoints_mhc_6l_2"
+INIT_CKPT_DIR="${BASE_DIR}/checkpoints_mhc_6l"
 LOG_DIR="${BASE_DIR}/logs"
 LOCK_DIR="${CKPT_DIR}/.train_autoresume.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
@@ -39,17 +40,17 @@ BASE_CMD=(
   python -m onyx.train
   --data_glob "/Users/owner/Desktop/caiatech/datasets/onyx-dataset.jsonl"
   --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizer"
-  --model_config "/Users/owner/Desktop/caiatech/models/onyx/configs/onyx_1m.json"
+  --model_config "/Users/owner/Desktop/caiatech/models/onyx/configs/onyx_1m_6l.json"
   --batch_size 4
   --max_seq_len 512
   --tokens_per_step 8192
   --num_epochs 1
-  --warmup_ratio 0.005
-  --save_dir "/Users/owner/Desktop/caiatech/models/onyx/checkpoints_mhc"
+  --warmup_ratio 0.08
+  --save_dir "/Users/owner/Desktop/caiatech/models/onyx/checkpoints_mhc_6l_2"
   --save_every_steps 5000
   --train_tokens_target 3146456434
   --log_every 1000
-  --log_file "/Users/owner/Desktop/caiatech/models/onyx/logs/onyx_1m_mhc_train.log"
+  --log_file "/Users/owner/Desktop/caiatech/models/onyx/logs/onyx_1m_6l_2_mhc_train.log"
   --mem_report_every 1000
   --mps_empty_cache_every 1000
   --gc_collect_every 200
@@ -61,6 +62,7 @@ BASE_CMD=(
   --mhc_n 2
   --mhc_mode mhc
   --mhc_sinkhorn_iters 10
+  --no-init_strict
 )
 
 RETRY_DELAY_SEC=5
@@ -80,8 +82,9 @@ on_stop() {
 trap on_stop INT TERM HUP
 
 get_ckpt_list() {
+  local dir="$1"
   local f base step
-  for f in "$CKPT_DIR"/checkpoint_step_*.pt "$CKPT_DIR"/interrupt_step_*.pt; do
+  for f in "$dir"/checkpoint_step_*.pt "$dir"/interrupt_step_*.pt; do
     [[ -e "$f" ]] || continue
     base="${f##*/}"
     step="${base##*_step_}"
@@ -92,23 +95,31 @@ get_ckpt_list() {
 }
 
 while true; do
+  # Prefer resuming from the new (6L) directory; if empty, warm-start from the latest
+  # checkpoint in the old directory.
   ckpts=()
   while IFS= read -r line; do
     [[ -n "$line" ]] && ckpts+=("$line")
-  done < <(get_ckpt_list || true)
+  done < <(get_ckpt_list "$CKPT_DIR" || true)
 
   ckpt=""
+  init_ckpt=""
   if [[ ${#ckpts[@]} -gt 0 ]]; then
     ckpt="${ckpts[0]}"
     if [[ "$ckpt" == "$last_ckpt" && $same_ckpt_failures -ge $MAX_SAME_CKPT_FAILURES && ${#ckpts[@]} -gt 1 ]]; then
       ckpt="${ckpts[1]}"
       echo "Latest checkpoint failed $same_ckpt_failures times; trying previous: $ckpt"
     fi
+  else
+    init_ckpt="$(get_ckpt_list "$INIT_CKPT_DIR" | head -n 1 || true)"
   fi
 
   CMD=("${BASE_CMD[@]}")
   if [[ -n "$ckpt" ]]; then
     CMD+=(--resume "$ckpt")
+  elif [[ -n "$init_ckpt" ]]; then
+    echo "No 6L checkpoints found; warm-starting from: $init_ckpt"
+    CMD+=(--init_checkpoint "$init_ckpt")
   fi
 
   start_ts=$(date +%s)

@@ -220,7 +220,7 @@ class TrainingConfig:
 
     # === Learning Rate ===
     learning_rate: float = 3e-4
-    min_lr: float = 1e-5
+    min_lr: float = 1e-4
     memory_lr_scale: float = 0.1
     warmup_steps: int = 50
     warmup_ratio: Optional[float] = None
@@ -284,6 +284,7 @@ class TrainingConfig:
     keep_every_steps: int = 0  # if >0, keep step checkpoints at multiples of this forever
     resume: Optional[str] = None
     init_checkpoint: Optional[str] = None  # load weights only
+    init_strict: bool = True  # if False, allow partial warm-start when architecture changes
     model_config_path: Optional[str] = None
     stage_name: str = ""
 
@@ -1107,6 +1108,64 @@ class Trainer:
 
         raise RuntimeError(f"Non-finite detected at {where} (step {self.global_step}).")
 
+    def _find_nonfinite_grads(self, max_items: int = 8) -> List[str]:
+        bad: List[str] = []
+        for name, p in self.model.named_parameters():
+            g = p.grad
+            if g is None:
+                continue
+            try:
+                finite = bool(torch.isfinite(g).all().item())
+            except Exception:
+                finite = False
+            if not finite:
+                bad.append(name)
+                if len(bad) >= max_items:
+                    break
+        return bad
+
+    def _safe_clip_grad_norm(self, max_norm: float, eps: float = 1e-6) -> float:
+        """
+        Safer alternative to torch.nn.utils.clip_grad_norm_.
+
+        On MPS, clip_grad_norm_ can sometimes produce NaN norms; this implementation:
+        - Computes the norm robustly by accumulating scalar sums on CPU
+        - Never scales gradients if the computed norm is non-finite
+        """
+        if max_norm <= 0:
+            return 0.0
+
+        total_sq = 0.0
+        found = False
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            if g.numel() == 0:
+                continue
+            found = True
+            if not torch.isfinite(g).all():
+                return float("nan")
+            gg = g.float()
+            total_sq += float((gg * gg).sum().item())
+
+        if not found:
+            return 0.0
+
+        total_norm = math.sqrt(total_sq)
+        if not math.isfinite(total_norm) or total_norm == 0.0:
+            return total_norm
+
+        clip_coef = float(max_norm) / (total_norm + float(eps))
+        if clip_coef >= 1.0:
+            return total_norm
+
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            p.grad.mul_(clip_coef)
+        return total_norm
+
     def _extract_vocab_size_from_ckpt(self, ckpt: Dict[str, Any]) -> Optional[int]:
         msd = ckpt.get("model_state_dict") or ckpt.get("model") or None
         if not isinstance(msd, dict):
@@ -1349,7 +1408,14 @@ class Trainer:
             if hasattr(self.model, "lm_head"):
                 self._resize_vocab_tensor(sd, "lm_head.weight", self.model.lm_head.weight)
 
-            self.model.load_state_dict(sd, strict=True)
+            incompatible = self.model.load_state_dict(sd, strict=cfg.init_strict)
+            if hasattr(incompatible, "missing_keys") and hasattr(incompatible, "unexpected_keys"):
+                if incompatible.missing_keys or incompatible.unexpected_keys:
+                    self._log(
+                        "[Init] Incompatible keys: "
+                        f"missing={len(incompatible.missing_keys)} unexpected={len(incompatible.unexpected_keys)}",
+                        force=True,
+                    )
             self._log("Init weights loaded.")
             if not cfg.use_amp:
                 enforce_fp32_everywhere(self.model)
@@ -1606,7 +1672,14 @@ class Trainer:
             if isinstance(mem_reg, torch.Tensor):
                 mem_reg = mem_reg / self.accumulation_steps
 
+            if isinstance(mem_reg, torch.Tensor) and not torch.isfinite(mem_reg).all():
+                self._log("[WARN] memory_reg_loss is non-finite; dropping it for this step.", force=True)
+                mem_reg = torch.zeros_like(loss)
+
             combined_loss = loss + mem_reg if isinstance(mem_reg, torch.Tensor) else loss
+            if isinstance(combined_loss, torch.Tensor) and not torch.isfinite(combined_loss).all():
+                self._log("[WARN] combined_loss is non-finite; falling back to loss only for this step.", force=True)
+                combined_loss = loss
 
             if self.scaler is not None:
                 self.scaler.scale(combined_loss).backward()
@@ -1672,9 +1745,15 @@ class Trainer:
         if cfg.gradient_clip > 0:
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.gradient_clip)
-            grad_norm_val = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+            if self.device_type == "mps":
+                grad_norm_val = float(self._safe_clip_grad_norm(cfg.gradient_clip))
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.gradient_clip)
+                grad_norm_val = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
             if not math.isfinite(grad_norm_val):
+                bad = self._find_nonfinite_grads()
+                if bad:
+                    self._log(f"[NaN] Non-finite grads in: {', '.join(bad)}", force=True)
                 self._nan_tripwire(
                     "grad_norm",
                     grad_norm=grad_norm_val,
@@ -2122,6 +2201,7 @@ def _build_config_from_args(args: argparse.Namespace) -> TrainingConfig:
         keep_every_steps=args.keep_every_steps,
         resume=args.resume,
         init_checkpoint=args.init_checkpoint,
+        init_strict=args.init_strict,
         log_every=args.log_every,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
@@ -2277,6 +2357,12 @@ def main():
 
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--init_checkpoint", type=str, default=None)
+    p.add_argument(
+        "--init_strict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If false, allow partial init_checkpoint loads when architecture changes (warm-start).",
+    )
 
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--log_file", type=str, default="")

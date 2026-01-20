@@ -1,316 +1,479 @@
+#!/usr/bin/env python3
+"""
+Onyx Memory Consolidation (Memory-Knobs Only)
+
+This module is designed for your specific intent:
+- DO NOT train the whole model
+- ONLY train memory-related "knobs" (eta/alpha/gate/value_gen by default)
+- Optionally compute a Fisher diagonal (EWC-style) *only for those knobs*
+- Or use a simpler anchor L2-to-previous (often just as good for tiny param sets)
+
+Key fixes vs your draft:
+- Uses model's own out["loss"] (correct shift + ignore_index masking)
+- Includes gate_proj (+ optional value_gen) as trainable
+- Handles streaming/Iterable dataloaders (requires fisher_sample_size or steps_per_epoch)
+- Averages Fisher over actually used batches
+- Saves/loads consolidation state safely (CPU tensors)
+
+Usage pattern (typical):
+1) Instantiate consolidator(model, dataloader, device, ...)
+2) (Optional) call initialize_anchors(...) to set theta_star and fisher
+3) call consolidate(...) for a few epochs/steps
+4) save_checkpoint(...) if desired
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Any, Callable, Iterable, Tuple
+
 import torch
-from typing import Dict, Optional, List
+from torch import nn
 from tqdm import tqdm
+
 from onyx.model import Onyx, M3Optimizer
+
+
+# -----------------------------
+# Config
+# -----------------------------
+
+@dataclass
+class ConsolidationConfig:
+    # Regularization knobs
+    use_fisher_ewc: bool = True         # If True, compute Fisher and use EWC penalty
+    ewc_lambda: float = 500.0           # Strength of EWC penalty
+    fisher_sample_size: Optional[int] = 256  # Batches for Fisher estimation (REQUIRED for Iterable/streaming)
+    importance_threshold: float = 1e-5  # Zero-out tiny Fisher entries
+
+    # Simple anchor alternative (often enough for memory knobs)
+    use_anchor_l2: bool = False         # If True, use anchor L2 penalty (no Fisher)
+    anchor_lambda: float = 1.0          # Strength for L2-to-theta_star (mean-squared)
+
+    # Training loop
+    lr: float = 1e-3
+    weight_decay: float = 0.0
+    gradient_clip: float = 1.0
+    epochs: int = 3
+    steps_per_epoch: Optional[int] = None  # If dataloader is streaming/infinite, set this
+    log_interval: int = 25
+
+    # What to train (by param-name substring)
+    train_eta_alpha_gate: bool = True
+    train_value_gen: bool = True
+    train_M_init: bool = False  # usually keep False (can destabilize)
+
+
+# -----------------------------
+# Consolidator
+# -----------------------------
 
 class OnyxMemoryConsolidator:
     def __init__(
-        self, 
-        model: Onyx, 
-        dataloader, 
-        device: torch.device, 
-        ewc_lambda: float = 500,
-        fisher_sample_size: Optional[int] = None,
-        importance_threshold: float = 1e-5
+        self,
+        model: Onyx,
+        dataloader: Iterable[Dict[str, Any]],
+        device: torch.device,
+        cfg: Optional[ConsolidationConfig] = None,
     ):
-        """
-        Memory consolidation with EWC for Onyx.
-        
-        Args:
-            model: Onyx model instance
-            dataloader: Training data loader
-            device: Compute device
-            ewc_lambda: EWC regularization strength
-            fisher_sample_size: Number of batches for Fisher estimation (None = all)
-            importance_threshold: Minimum Fisher value to consider (memory optimization)
-        """
         self.model = model.to(device)
         self.dataloader = dataloader
         self.device = device
-        self.ewc_lambda = ewc_lambda
-        self.fisher_sample_size = fisher_sample_size
-        self.importance_threshold = importance_threshold
-        
-        # Knowledge anchors
+        self.cfg = cfg or ConsolidationConfig()
+
+        # Anchors + importance
         self.theta_star: Dict[str, torch.Tensor] = {}
         self.fisher_diagonal: Dict[str, torch.Tensor] = {}
-        
-        # Track trainable parameters
+
+        # Freeze/unfreeze memory knobs only
         self._freeze_backbone()
-        
-    def _freeze_backbone(self):
-        """Freeze all parameters except memory-related ones."""
+
+    # -----------------------------
+    # Param selection
+    # -----------------------------
+
+    def _is_trainable_memory_param(self, name: str) -> bool:
+        """
+        Decide if a parameter name should be trained in consolidation.
+        Adjust this to match your architecture conventions.
+        """
+        # eta/alpha/gate projections live inside your memory modules
+        if self.cfg.train_eta_alpha_gate:
+            if ("eta_proj" in name) or ("alpha_proj" in name) or ("gate_proj" in name):
+                return True
+
+        # optional: value generator if generate_own_values=True
+        if self.cfg.train_value_gen:
+            if "value_gen" in name:
+                return True
+
+        # optional: allow M_init to train (usually avoid)
+        if self.cfg.train_M_init:
+            if name.endswith("M_init") or ".M_init" in name:
+                return True
+
+        return False
+
+    def _freeze_backbone(self) -> None:
         trainable_params = 0
         frozen_params = 0
-        
+
         for name, param in self.model.named_parameters():
-            # Memory tensors and learning rates are trainable
-            if any(key in name for key in ["memory", "eta_", "alpha_"]):
+            if self._is_trainable_memory_param(name):
                 param.requires_grad = True
                 trainable_params += param.numel()
             else:
                 param.requires_grad = False
                 frozen_params += param.numel()
-        
-        print(f"Trainable Parameters: {trainable_params:,} | Frozen: {frozen_params:,}")
-    
+
+        print(f"[Consolidator] Trainable params: {trainable_params:,} | Frozen: {frozen_params:,}")
+
+    def _trainable_named_params(self) -> List[Tuple[str, torch.Tensor]]:
+        return [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
+
+    # -----------------------------
+    # Anchors
+    # -----------------------------
+
+    @torch.no_grad()
+    def snapshot_theta_star(self) -> None:
+        """Store current trainable memory-knob parameters as anchors."""
+        self.theta_star = {}
+        for n, p in self._trainable_named_params():
+            self.theta_star[n] = p.detach().clone().to("cpu")
+        print(f"[Consolidator] theta_star captured for {len(self.theta_star)} tensors.")
+
+    def initialize_anchors(
+        self,
+        memory_states: Optional[List[Dict[str, Any]]] = None,
+        compute_fisher: Optional[bool] = None,
+        verbose: bool = True,
+    ) -> None:
+        """
+        Capture theta_star and (optionally) compute fisher_diagonal for EWC.
+        """
+        self.snapshot_theta_star()
+        do_fisher = self.cfg.use_fisher_ewc if compute_fisher is None else compute_fisher
+        if do_fisher:
+            self.fisher_diagonal = self.estimate_importance(memory_states=memory_states, verbose=verbose)
+            print(f"[Consolidator] fisher_diagonal computed for {len(self.fisher_diagonal)} tensors.")
+        else:
+            self.fisher_diagonal = {}
+            print("[Consolidator] fisher_diagonal skipped.")
+
+    # -----------------------------
+    # Fisher estimation
+    # -----------------------------
+
+    def _require_fisher_sample_size(self) -> int:
+        if self.cfg.fisher_sample_size is None or self.cfg.fisher_sample_size <= 0:
+            raise ValueError(
+                "fisher_sample_size must be set (>0), especially for streaming/Iterable dataloaders."
+            )
+        return int(self.cfg.fisher_sample_size)
+
     def estimate_importance(
-        self, 
-        memory_states: Optional[Dict] = None,
-        verbose: bool = True
+        self,
+        memory_states: Optional[List[Dict[str, Any]]] = None,
+        verbose: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
-        Estimate Fisher Information Matrix (empirical approximation).
-        
-        Uses the gradient of log-likelihood to identify parameters critical
-        for preserving current knowledge.
-        
-        Args:
-            memory_states: Optional memory state dict
-            verbose: Show progress bar
-            
-        Returns:
-            Dictionary mapping parameter names to Fisher diagonal values
+        Empirical Fisher diagonal approximation for ONLY trainable memory knobs.
+
+        Uses squared gradients of the model's own training loss:
+        - correct shift
+        - ignore_index handling
         """
         self.model.eval()
-        fisher = {}
-        
-        # Only track gradients for trainable parameters
-        trainable_params = {
-            n: p for n, p in self.model.named_parameters() 
-            if p.requires_grad
-        }
-        
-        # Initialize Fisher accumulators
-        for n, p in trainable_params.items():
-            fisher[n] = torch.zeros_like(p.data)
-        
+
+        trainable = {n: p for n, p in self.model.named_parameters() if p.requires_grad}
+        fisher = {n: torch.zeros_like(p.data) for n, p in trainable.items()}
+
+        num_batches = self._require_fisher_sample_size()
+        it = iter(self.dataloader)
+        rng = range(num_batches)
         if verbose:
-            print(f"Estimating Fisher Information Matrix...")
-        
-        # Determine number of batches to use
-        num_batches = (
-            min(self.fisher_sample_size, len(self.dataloader))
-            if self.fisher_sample_size 
-            else len(self.dataloader)
-        )
-        
-        dataloader_iter = iter(self.dataloader)
-        iterator = tqdm(range(num_batches), desc="Fisher Estimation") if verbose else range(num_batches)
-        
-        for _ in iterator:
+            print("[Consolidator] Estimating Fisher diagonal...")
+            rng = tqdm(rng, desc="Fisher")
+
+        used = 0
+        for _ in rng:
             try:
-                batch = next(dataloader_iter)
+                batch = next(it)
             except StopIteration:
                 break
-                
-            self.model.zero_grad()
-            
+
+            # Clear grads only for trainable
+            for p in trainable.values():
+                p.grad = None
+
             input_ids = batch["input_ids"].to(self.device)
             labels = batch.get("labels", input_ids).to(self.device)
-            
-            # Forward pass WITHOUT memory updates (pure inference)
-            with torch.set_grad_enabled(True):
-                out = self.model(
-                    input_ids, 
-                    memory_states=memory_states, 
-                    update_memories=False
-                )
-                
-                # Compute log-likelihood loss
-                log_probs = torch.nn.functional.log_softmax(out["logits"], dim=-1)
-                loss = torch.nn.functional.nll_loss(
-                    log_probs.view(-1, log_probs.size(-1)), 
-                    labels.view(-1), 
-                    ignore_index=-100
-                )
-                
-                loss.backward()
-            
-            # Accumulate squared gradients (Fisher diagonal approximation)
-            for n, p in trainable_params.items():
-                if p.grad is not None:
-                    fisher[n] += (p.grad.data ** 2) / num_batches
-        
-        # Apply importance threshold (memory optimization)
-        for n in fisher:
-            fisher[n] = torch.where(
-                fisher[n] > self.importance_threshold,
-                fisher[n],
-                torch.zeros_like(fisher[n])
+
+            out = self.model(
+                input_ids=input_ids,
+                labels=labels,
+                memory_states=memory_states,
+                update_memories=False,
             )
-        
+            loss = out.get("loss")
+            if loss is None:
+                continue
+
+            loss.backward()
+            used += 1
+
+            for n, p in trainable.items():
+                if p.grad is not None:
+                    fisher[n].add_(p.grad.detach().pow(2))
+
+        if used == 0:
+            # Return zeros (nothing learned)
+            self.model.train()
+            return fisher
+
+        # Average + threshold
+        thr = float(self.cfg.importance_threshold or 0.0)
+        for n in fisher:
+            fisher[n].div_(used)
+            if thr > 0:
+                fisher[n] = torch.where(fisher[n] > thr, fisher[n], torch.zeros_like(fisher[n]))
+
         self.model.train()
         return fisher
-    
+
+    # -----------------------------
+    # Penalties
+    # -----------------------------
+
     def compute_ewc_loss(self) -> torch.Tensor:
         """
-        Compute EWC regularization penalty.
-        
-        Acts as a "spring" pulling parameters back toward their
-        optimal values (theta_star) weighted by importance (Fisher).
-        
-        Returns:
-            Scalar penalty term
+        EWC penalty on trainable memory knobs: (lambda/2) * sum(F_i * (theta - theta*)^2)
         """
         if not self.theta_star or not self.fisher_diagonal:
-            return torch.tensor(0.0, device=self.device)
-        
-        penalty = 0.0
-        for n, p in self.model.named_parameters():
-            if n in self.fisher_diagonal and p.requires_grad:
-                fisher = self.fisher_diagonal[n]
-                theta_star = self.theta_star[n]
-                
-                # Quadratic penalty weighted by importance
-                penalty += (fisher * (p - theta_star) ** 2).sum()
-        
-        return (self.ewc_lambda / 2) * penalty
-    
+            return torch.zeros((), device=self.device)
+
+        penalty = torch.zeros((), device=self.device)
+        lam = float(self.cfg.ewc_lambda)
+
+        for n, p in self._trainable_named_params():
+            if n not in self.fisher_diagonal or n not in self.theta_star:
+                continue
+            F = self.fisher_diagonal[n].to(device=self.device, dtype=p.dtype)
+            th0 = self.theta_star[n].to(device=self.device, dtype=p.dtype)
+            penalty = penalty + (F * (p - th0).pow(2)).sum()
+
+        return (lam / 2.0) * penalty
+
+    def compute_anchor_l2_loss(self) -> torch.Tensor:
+        """
+        Simple L2-to-anchor (mean-squared) penalty:
+          anchor_lambda * mean((theta - theta*)^2)
+        Often sufficient for tiny param sets, cheaper than Fisher.
+        """
+        if not self.theta_star:
+            return torch.zeros((), device=self.device)
+
+        lam = float(self.cfg.anchor_lambda)
+        penalty = torch.zeros((), device=self.device)
+        count = 0
+
+        for n, p in self._trainable_named_params():
+            if n not in self.theta_star:
+                continue
+            th0 = self.theta_star[n].to(device=self.device, dtype=p.dtype)
+            penalty = penalty + (p - th0).pow(2).mean()
+            count += 1
+
+        if count == 0:
+            return torch.zeros((), device=self.device)
+        return lam * penalty
+
+    # -----------------------------
+    # Consolidation loop
+    # -----------------------------
+
     def consolidate(
-        self, 
-        memory_states: Optional[Dict] = None,
-        epochs: int = 5,
-        lr: float = 1e-3,
-        gradient_clip: float = 1.0,
-        log_interval: int = 10,
-        validate_fn: Optional[callable] = None
+        self,
+        memory_states: Optional[List[Dict[str, Any]]] = None,
+        validate_fn: Optional[Callable[[Onyx, Optional[List[Dict[str, Any]]]], float]] = None,
+        verbose: bool = True,
     ) -> Dict[str, List[float]]:
         """
-        Main consolidation loop with global optimization.
-        
-        Args:
-            memory_states: Optional memory state dict
-            epochs: Number of training epochs
-            lr: Learning rate
-            gradient_clip: Max gradient norm (0 = no clipping)
-            log_interval: Batches between progress updates
-            validate_fn: Optional validation callback
-            
-        Returns:
-            Dictionary of training metrics
+        Train ONLY the memory knobs on dataloader with optional regularization to anchors.
         """
-        # Collect trainable parameters
-        trainable_params = [
-            p for p in self.model.named_parameters() 
-            if p[1].requires_grad
-        ]
-        
-        optimizer = M3Optimizer([p for _, p in trainable_params], lr=lr)
-        
-        metrics = {
-            "train_loss": [],
-            "nll_loss": [],
-            "ewc_loss": [],
-            "val_loss": []
-        }
-        
-        print(f"\n{'='*60}")
-        print(f"Memory Consolidation (EWC λ={self.ewc_lambda})")
-        print(f"{'='*60}")
-        
-        for epoch in range(epochs):
+        trainable = self._trainable_named_params()
+        if not trainable:
+            raise RuntimeError("No trainable memory parameters found. Check name filters.")
+
+        params_only = [p for _, p in trainable]
+        optimizer = M3Optimizer(
+            params_only,
+            lr=float(self.cfg.lr),
+            weight_decay=float(self.cfg.weight_decay),
+        )
+
+        metrics = {"train_loss": [], "nll_loss": [], "reg_loss": [], "val_loss": []}
+
+        epochs = int(self.cfg.epochs)
+        steps_cap = self.cfg.steps_per_epoch
+
+        print("\n" + "=" * 70)
+        reg_mode = "EWC" if self.cfg.use_fisher_ewc else ("AnchorL2" if self.cfg.use_anchor_l2 else "None")
+        print(f"[Consolidator] Consolidation: epochs={epochs} lr={self.cfg.lr} reg={reg_mode}")
+        print("=" * 70)
+
+        for ep in range(epochs):
             self.model.train()
-            epoch_nll = 0.0
-            epoch_ewc = 0.0
-            epoch_total = 0.0
-            
-            pbar = tqdm(self.dataloader, desc=f"Epoch {epoch+1}/{epochs}")
-            
-            for batch_idx, batch in enumerate(pbar):
-                optimizer.zero_grad()
-                
-                # Forward pass
+
+            ep_nll = 0.0
+            ep_reg = 0.0
+            ep_total = 0.0
+            used_steps = 0
+
+            iterator = iter(self.dataloader)
+            if steps_cap is None:
+                # If dataloader has __len__, use it; otherwise require steps_per_epoch
+                try:
+                    steps_cap = len(self.dataloader)  # type: ignore
+                except Exception:
+                    raise ValueError("steps_per_epoch must be set for streaming/Iterable dataloaders.")
+
+            step_range = range(int(steps_cap))
+            if verbose:
+                step_range = tqdm(step_range, desc=f"Epoch {ep+1}/{epochs}")
+
+            for step_idx in step_range:
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    break
+
+                optimizer.zero_grad(set_to_none=True)
+
+                input_ids = batch["input_ids"].to(self.device)
+                labels = batch.get("labels", input_ids).to(self.device)
+
                 out = self.model(
-                    batch["input_ids"].to(self.device),
-                    labels=batch.get("labels", batch["input_ids"]).to(self.device),
+                    input_ids=input_ids,
+                    labels=labels,
                     memory_states=memory_states,
-                    update_memories=False  # Optimizer-driven only
+                    update_memories=False,
                 )
-                
-                # Compute combined loss
-                nll_loss = out["loss"]
-                ewc_loss = self.compute_ewc_loss()
-                total_loss = nll_loss + ewc_loss
-                
-                # Backward pass
-                total_loss.backward()
-                
-                # Gradient clipping
-                if gradient_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for _, p in trainable_params], 
-                        gradient_clip
-                    )
-                
+                nll = out.get("loss")
+                if nll is None:
+                    continue
+
+                # Regularization term
+                if self.cfg.use_fisher_ewc and self.theta_star and self.fisher_diagonal:
+                    reg = self.compute_ewc_loss()
+                elif self.cfg.use_anchor_l2 and self.theta_star:
+                    reg = self.compute_anchor_l2_loss()
+                else:
+                    reg = torch.zeros((), device=self.device)
+
+                total = nll + reg
+                total.backward()
+
+                if self.cfg.gradient_clip and self.cfg.gradient_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(params_only, float(self.cfg.gradient_clip))
+
                 optimizer.step()
-                
-                # Track metrics
-                epoch_nll += nll_loss.item()
-                epoch_ewc += ewc_loss.item()
-                epoch_total += total_loss.item()
-                
-                # Update progress bar
-                if batch_idx % log_interval == 0:
-                    pbar.set_postfix({
-                        'NLL': f'{nll_loss.item():.4f}',
-                        'EWC': f'{ewc_loss.item():.4f}',
-                        'Total': f'{total_loss.item():.4f}'
-                    })
-            
-            # Epoch summary
-            avg_nll = epoch_nll / len(self.dataloader)
-            avg_ewc = epoch_ewc / len(self.dataloader)
-            avg_total = epoch_total / len(self.dataloader)
-            
-            metrics["train_loss"].append(avg_total)
+
+                ep_nll += float(nll.detach().item())
+                ep_reg += float(reg.detach().item())
+                ep_total += float(total.detach().item())
+                used_steps += 1
+
+                if verbose and self.cfg.log_interval and (step_idx % int(self.cfg.log_interval) == 0):
+                    if hasattr(step_range, "set_postfix"):
+                        step_range.set_postfix({
+                            "nll": f"{float(nll.detach().item()):.4f}",
+                            "reg": f"{float(reg.detach().item()):.4f}",
+                            "tot": f"{float(total.detach().item()):.4f}",
+                        })
+
+            denom = max(1, used_steps)
+            avg_nll = ep_nll / denom
+            avg_reg = ep_reg / denom
+            avg_total = ep_total / denom
+
             metrics["nll_loss"].append(avg_nll)
-            metrics["ewc_loss"].append(avg_ewc)
-            
-            print(f"\nEpoch {epoch+1} Summary:")
-            print(f"  NLL Loss:   {avg_nll:.4f}")
-            print(f"  EWC Loss:   {avg_ewc:.4f}")
-            print(f"  Total Loss: {avg_total:.4f}")
-            
-            # Optional validation
-            if validate_fn:
-                val_loss = validate_fn(self.model, memory_states)
-                metrics["val_loss"].append(val_loss)
-                print(f"  Val Loss:   {val_loss:.4f}")
-            
-            print()
-        
-        # Update knowledge anchors for continual learning
-        print("Updating knowledge anchors...")
-        self.fisher_diagonal = self.estimate_importance(memory_states, verbose=False)
-        self.theta_star = {
-            n: p.data.clone() 
-            for n, p in self.model.named_parameters() 
-            if p.requires_grad
-        }
-        
-        print(f"✓ Consolidation complete\n")
+            metrics["reg_loss"].append(avg_reg)
+            metrics["train_loss"].append(avg_total)
+
+            print(f"\n[Epoch {ep+1}] nll={avg_nll:.4f} reg={avg_reg:.4f} total={avg_total:.4f}")
+
+            if validate_fn is not None:
+                try:
+                    val = float(validate_fn(self.model, memory_states))
+                    metrics["val_loss"].append(val)
+                    print(f"[Epoch {ep+1}] val={val:.4f}")
+                except Exception as e:
+                    print(f"[Epoch {ep+1}] validate_fn failed: {e}")
+
+        # Refresh anchors at the end (optional, but useful for continual phases)
+        print("[Consolidator] Updating theta_star and fisher...")
+        self.snapshot_theta_star()
+        if self.cfg.use_fisher_ewc:
+            self.fisher_diagonal = self.estimate_importance(memory_states=memory_states, verbose=False)
+
+        print("[Consolidator] ✓ Consolidation complete\n")
         return metrics
 
-    def distill(self, *args, **kwargs) -> Dict[str, List[float]]:
+    # Convenience alias
+    def distill(self, *args, **kwargs):
         return self.consolidate(*args, **kwargs)
-    
-    def save_checkpoint(self, path: str):
-        """Save consolidator state including Fisher and theta_star."""
-        checkpoint = {
-            'theta_star': self.theta_star,
-            'fisher_diagonal': self.fisher_diagonal,
-            'ewc_lambda': self.ewc_lambda,
-            'model_state': self.model.state_dict()
+
+    # -----------------------------
+    # Save/load
+    # -----------------------------
+
+    def save_checkpoint(self, path: str) -> None:
+        """
+        Save:
+        - model_state (ONLY current model weights)
+        - theta_star (CPU tensors)
+        - fisher_diagonal (CPU tensors)
+        - cfg (as dict)
+        """
+        def to_cpu(d: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+            return {k: v.detach().to("cpu") for k, v in d.items()}
+
+        ckpt = {
+            "model_state": self.model.state_dict(),
+            "theta_star": to_cpu(self.theta_star) if self.theta_star else {},
+            "fisher_diagonal": to_cpu(self.fisher_diagonal) if self.fisher_diagonal else {},
+            "cfg": self.cfg.__dict__,
         }
-        torch.save(checkpoint, path)
-        print(f"Checkpoint saved to {path}")
-    
-    def load_checkpoint(self, path: str):
-        """Load consolidator state."""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.theta_star = checkpoint['theta_star']
-        self.fisher_diagonal = checkpoint['fisher_diagonal']
-        self.ewc_lambda = checkpoint['ewc_lambda']
-        self.model.load_state_dict(checkpoint['model_state'])
-        print(f"Checkpoint loaded from {path}")
+        torch.save(ckpt, path)
+        print(f"[Consolidator] Saved checkpoint: {path}")
+
+    def load_checkpoint(self, path: str) -> None:
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
+        # Restore cfg if present
+        cfg_dict = ckpt.get("cfg")
+        if isinstance(cfg_dict, dict):
+            self.cfg = ConsolidationConfig(**cfg_dict)
+
+        # Reload model weights
+        ms = ckpt.get("model_state")
+        if isinstance(ms, dict):
+            self.model.load_state_dict(ms, strict=True)
+
+        # Restore anchors
+        self.theta_star = {}
+        ts = ckpt.get("theta_star", {})
+        if isinstance(ts, dict):
+            self.theta_star = {k: v.detach().to("cpu") for k, v in ts.items() if torch.is_tensor(v)}
+
+        self.fisher_diagonal = {}
+        fd = ckpt.get("fisher_diagonal", {})
+        if isinstance(fd, dict):
+            self.fisher_diagonal = {k: v.detach().to("cpu") for k, v in fd.items() if torch.is_tensor(v)}
+
+        # Re-freeze with the possibly restored config
+        self._freeze_backbone()
+        print(f"[Consolidator] Loaded checkpoint: {path}")
