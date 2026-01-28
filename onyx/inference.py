@@ -19,6 +19,7 @@ import sys
 import dataclasses
 import re
 from pathlib import Path
+from contextlib import nullcontext
 from typing import Optional, List, Dict, Any, Generator, Tuple
 from collections import deque, Counter
 
@@ -204,6 +205,11 @@ def load_model(
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float32,
     model_config_path: Optional[str] = None,
+    experimental_mhc: Optional[bool] = None,
+    mhc_n: Optional[int] = None,
+    mhc_mode: Optional[str] = None,
+    mhc_sinkhorn: Optional[bool] = None,
+    mhc_sinkhorn_iters: Optional[int] = None,
 ):
     print(f"Loading checkpoint from: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -217,6 +223,8 @@ def load_model(
         flat = _flatten_cfg(cfg_json)
         filtered = {k: v for k, v in flat.items() if k in valid_fields}
         config = OnyxConfig(**filtered)
+    elif model_config_path:
+        print(f"[Warn] model_config not found, ignoring: {model_config_path}")
 
     if config is None and isinstance(ckpt, dict) and "config" in ckpt:
         cfg_data = ckpt["config"]
@@ -244,6 +252,10 @@ def load_model(
         print("[Warn] No config found in checkpoint or args, using defaults.")
         config = OnyxConfig()
 
+    train_cfg = ckpt.get("config") if isinstance(ckpt, dict) else None
+    if not isinstance(train_cfg, dict):
+        train_cfg = {}
+
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         state = ckpt["model_state_dict"]
     elif isinstance(ckpt, dict) and "model" in ckpt:
@@ -263,7 +275,36 @@ def load_model(
         print(f"Resizing config.vocab_size: {config.vocab_size} -> {target_vocab}")
         config.vocab_size = target_vocab
 
-    model = Onyx(config)
+    if experimental_mhc is None:
+        experimental_mhc = bool(train_cfg.get("experimental_mhc", False))
+
+    if experimental_mhc:
+        from onyx.experimental import OnyxMHC
+
+        mhc_n = int(mhc_n if mhc_n is not None else train_cfg.get("mhc_n", 2))
+        mhc_mode = str(mhc_mode if mhc_mode is not None else train_cfg.get("mhc_mode", "mhc"))
+        if mhc_sinkhorn is None:
+            mhc_sinkhorn = bool(train_cfg.get("mhc_sinkhorn", True))
+        mhc_sinkhorn_iters = int(
+            mhc_sinkhorn_iters if mhc_sinkhorn_iters is not None else train_cfg.get("mhc_sinkhorn_iters", 10)
+        )
+        print(
+            "[Experimental] Using OnyxMHC mhc_n={n} mhc_mode={mode} sinkhorn={sinkhorn} iters={iters}".format(
+                n=mhc_n,
+                mode=mhc_mode,
+                sinkhorn=mhc_sinkhorn,
+                iters=mhc_sinkhorn_iters,
+            )
+        )
+        model = OnyxMHC(
+            config,
+            mhc_n=mhc_n,
+            mhc_mode=mhc_mode,
+            mhc_sinkhorn=mhc_sinkhorn,
+            mhc_sinkhorn_iters=mhc_sinkhorn_iters,
+        )
+    else:
+        model = Onyx(config)
 
     def _pad_or_trunc(key: str):
         if key not in state:
@@ -293,8 +334,22 @@ def load_model(
         if real_missing:
             print(f"[Warn] Missing keys: {real_missing[:5]}...")
 
+    # On Apple MPS, casting weights to fp16/bf16 can trigger hard failures in some
+    # matmul kernels when mixed with fp32 accumulations. Keep weights in fp32 and
+    # use autocast for activations instead.
+    requested_dtype = dtype
+    autocast_dtype: Optional[torch.dtype] = None
+    if device.type == "mps" and requested_dtype in (torch.float16, torch.bfloat16):
+        autocast_dtype = requested_dtype
+        dtype = torch.float32
+        print(
+            f"[Warn] MPS requested dtype={requested_dtype}; keeping weights in float32 and using autocast({autocast_dtype})."
+        )
+
     model = model.to(device=device, dtype=dtype)
     model.eval()
+    if autocast_dtype is not None:
+        setattr(model, "_inference_autocast_dtype", autocast_dtype)
     return model, config
 
 
@@ -335,7 +390,14 @@ def generate_stream(
     generated_count = 0
     recent = deque(maxlen=max(64, rep_window * 2))  # keep enough for ngram + window penalties
 
-    with torch.no_grad():
+    autocast_dtype = getattr(model, "_inference_autocast_dtype", None)
+    autocast_ctx = (
+        torch.autocast(device_type="mps", dtype=autocast_dtype)
+        if (autocast_dtype is not None and device.type == "mps")
+        else nullcontext()
+    )
+
+    with torch.no_grad(), autocast_ctx:
         outputs = model(
             input_ids,
             memory_states=memory_states,
@@ -348,7 +410,7 @@ def generate_stream(
         position_offset = S
 
     for _ in range(max_new_tokens):
-        with torch.no_grad():
+        with torch.no_grad(), autocast_ctx:
             logits = outputs["logits"][:, -1, :]
 
             if eos_token_id is not None and generated_count < min_tokens_before_eos:
@@ -428,6 +490,7 @@ def chat(
     freq_penalty: float = 0.3,
     ban_run_len: int = 4,
     no_repeat_ngram_size: int = 3,
+    chat_template: str = "onyx",
 ):
     onyx_tag = _onyx_blue("onyx")
     device_str = getattr(device, "type", str(device))
@@ -481,11 +544,20 @@ def chat(
             continue
 
         prompt = ""
-        if system_prompt:
-            prompt += f"System: {system_prompt}\n\n"
-        if conversation_history:
-            prompt += "\n\n".join(conversation_history[-max_history_turns:]).rstrip() + "\n\n"
-        prompt += f"User: {user_input}\nAssistant: "
+        if chat_template == "onyx":
+            if system_prompt:
+                prompt += f"System: {system_prompt}\n\n"
+            if conversation_history:
+                prompt += "\n\n".join(conversation_history[-max_history_turns:]).rstrip() + "\n\n"
+            prompt += f"User: {user_input}\nAssistant: "
+        elif chat_template == "raw":
+            if system_prompt:
+                prompt += system_prompt.rstrip() + "\n\n"
+            if conversation_history:
+                prompt += "\n\n".join(conversation_history[-max_history_turns:]).rstrip() + "\n\n"
+            prompt += user_input
+        else:
+            raise ValueError(f"Unknown chat_template: {chat_template}")
 
         input_ids = tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=False).to(device)
 
@@ -543,7 +615,10 @@ def chat(
                 break
 
         print("")
-        conversation_history.append(f"User: {user_input}\nAssistant: {generated_text}")
+        if chat_template == "onyx":
+            conversation_history.append(f"User: {user_input}\nAssistant: {generated_text}")
+        else:
+            conversation_history.append(f"{user_input}\n{generated_text}")
 
         if learning and memory_mode == "persistent" and memory_path:
             model.save_memory_states(memory_states, memory_path)
@@ -557,6 +632,13 @@ def main():
     parser.add_argument("--memory", type=str, default="session", choices=["stateless", "session", "persistent"])
     parser.add_argument("--memory_path", type=str, default=None)
     parser.add_argument("--learning", action="store_true")
+
+    # Experimental: load OnyxMHC checkpoints (matches --experimental_mhc training)
+    parser.add_argument("--experimental_mhc", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--mhc_n", type=int, default=None)
+    parser.add_argument("--mhc_mode", type=str, choices=["mhc", "hc"], default=None)
+    parser.add_argument("--mhc_sinkhorn", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--mhc_sinkhorn_iters", type=int, default=None)
 
     # Decoding params
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -574,6 +656,7 @@ def main():
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="float32")
+    parser.add_argument("--chat_template", type=str, choices=["onyx", "raw"], default="onyx")
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--stream", action="store_true", default=True, help="Enable streaming (default)")
@@ -597,7 +680,18 @@ def main():
         return
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-    model, _ = load_model(args.checkpoint, tokenizer, device=device, dtype=dtype, model_config_path=args.model_config)
+    model, _ = load_model(
+        args.checkpoint,
+        tokenizer,
+        device=device,
+        dtype=dtype,
+        model_config_path=args.model_config,
+        experimental_mhc=args.experimental_mhc,
+        mhc_n=args.mhc_n,
+        mhc_mode=args.mhc_mode,
+        mhc_sinkhorn=args.mhc_sinkhorn,
+        mhc_sinkhorn_iters=args.mhc_sinkhorn_iters,
+    )
 
     if args.prompt:
         onyx_tag = _onyx_blue("onyx")
@@ -693,6 +787,7 @@ def main():
             freq_penalty=args.freq_penalty,
             ban_run_len=args.ban_run_len,
             no_repeat_ngram_size=args.no_repeat_ngram_size,
+            chat_template=args.chat_template,
         )
 
 

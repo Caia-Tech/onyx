@@ -8,11 +8,44 @@ if [[ -z "${CAFFEINATED:-}" ]]; then
 fi
 
 BASE_DIR="/Users/owner/Desktop/caiatech/models/onyx"
-CKPT_DIR="${BASE_DIR}/checkpoints_mhc_6l_2"
-INIT_CKPT_DIR="${BASE_DIR}/checkpoints_mhc_6l"
-LOG_DIR="${BASE_DIR}/logs"
+DATA_GLOB="${DATA_GLOB:-/Users/owner/Desktop/caiatech/datasets/datamix.shuffled.jsonl}"
+SHUFFLE_BUFFER_DOCS="${SHUFFLE_BUFFER_DOCS:-2048}"
+MODEL_CONFIG="${MODEL_CONFIG:-${BASE_DIR}/configs/onyx.json}"
+RUN_NAME="${RUN_NAME:-onyx_64d_1l_mhc_shuf}"
+CKPT_DIR="${CKPT_DIR:-${BASE_DIR}/checkpoints/onyx_64d_1l_mhc_shuf}"
+VAST_CKPT_DIR="${VAST_CKPT_DIR:-}"
+VAST_CKPT="${VAST_CKPT:-}"
+INIT_CKPT="${INIT_CKPT:-}"
+INIT_CKPT_DIR="${INIT_CKPT_DIR:-}"
+LOG_DIR="${LOG_DIR:-${BASE_DIR}/logs}"
+LOG_EVERY="${LOG_EVERY:-100}"
+MONITOR_EVERY="${MONITOR_EVERY:-100}"          # 0 = follow log_every
+ALERT_EFFECTIVE_VOCAB="${ALERT_EFFECTIVE_VOCAB:-100}"
+MEM_REPORT_EVERY="${MEM_REPORT_EVERY:-100}"
+PEAK_LR="${PEAK_LR:-5e-4}"
+MIN_LR="${MIN_LR:-2e-4}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.001}"
 LOCK_DIR="${CKPT_DIR}/.train_autoresume.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
+
+if [[ -z "${AMP_DTYPE:-}" ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    AMP_DTYPE="float16"
+  else
+    AMP_DTYPE="bfloat16"
+  fi
+fi
+
+export PYTORCH_ENABLE_MPS_FALLBACK="${PYTORCH_ENABLE_MPS_FALLBACK:-1}"
+
+if [[ ! -e "$DATA_GLOB" ]]; then
+  echo "DATA_GLOB not found: $DATA_GLOB" >&2
+  exit 2
+fi
+if [[ ! -d "/Users/owner/Desktop/caiatech/datasets/tokenizers/onyx-tokenizer" ]]; then
+  echo "Tokenizer dir not found" >&2
+  exit 2
+fi
 
 mkdir -p "$CKPT_DIR" "$LOG_DIR"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -38,20 +71,27 @@ trap cleanup_lock EXIT
 
 BASE_CMD=(
   python -m onyx.train
-  --data_glob "/Users/owner/Desktop/caiatech/datasets/onyx-dataset.jsonl"
-  --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizer"
-  --model_config "/Users/owner/Desktop/caiatech/models/onyx/configs/onyx_1m_6l.json"
-  --batch_size 4
-  --max_seq_len 512
+  --data_glob "$DATA_GLOB"
+  --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizers/onyx-tokenizer"
+  --model_config "$MODEL_CONFIG"
+  --batch_size 64
+  --max_seq_len 256
   --tokens_per_step 8192
+  --shuffle_buffer_docs "$SHUFFLE_BUFFER_DOCS"
   --num_epochs 1
-  --warmup_ratio 0.08
-  --save_dir "/Users/owner/Desktop/caiatech/models/onyx/checkpoints_mhc_6l_2"
-  --save_every_steps 5000
-  --train_tokens_target 3146456434
-  --log_every 1000
-  --log_file "/Users/owner/Desktop/caiatech/models/onyx/logs/onyx_1m_6l_2_mhc_train.log"
-  --mem_report_every 1000
+  --learning_rate "$PEAK_LR"
+  --min_lr "$MIN_LR"
+  --warmup_ratio "$WARMUP_RATIO"
+  --amp
+  --amp_dtype "$AMP_DTYPE"
+  --save_dir "$CKPT_DIR"
+  --save_every_steps 1000
+  --train_tokens_target 30000000000
+  --log_every "$LOG_EVERY"
+  --monitor_every "$MONITOR_EVERY"
+  --alert_effective_vocab "$ALERT_EFFECTIVE_VOCAB"
+  --log_file "${LOG_DIR}/${RUN_NAME}_train.log"
+  --mem_report_every "$MEM_REPORT_EVERY"
   --mps_empty_cache_every 1000
   --gc_collect_every 200
   --max_rss_gb 10
@@ -95,8 +135,8 @@ get_ckpt_list() {
 }
 
 while true; do
-  # Prefer resuming from the new (6L) directory; if empty, warm-start from the latest
-  # checkpoint in the old directory.
+  # Prefer resuming from $CKPT_DIR; if empty, resume from the downloaded Vast.ai
+  # checkpoint; if none, warm-start from the latest init checkpoint.
   ckpts=()
   while IFS= read -r line; do
     [[ -n "$line" ]] && ckpts+=("$line")
@@ -111,14 +151,27 @@ while true; do
       echo "Latest checkpoint failed $same_ckpt_failures times; trying previous: $ckpt"
     fi
   else
-    init_ckpt="$(get_ckpt_list "$INIT_CKPT_DIR" | head -n 1 || true)"
+    if [[ -n "${VAST_CKPT:-}" && -f "$VAST_CKPT" ]]; then
+      ckpt="$VAST_CKPT"
+    elif [[ -n "${VAST_CKPT_DIR:-}" && -d "$VAST_CKPT_DIR" ]]; then
+      ckpt="$(get_ckpt_list "$VAST_CKPT_DIR" | head -n 1 || true)"
+    fi
+    if [[ -z "${ckpt:-}" ]]; then
+      if [[ -n "${INIT_CKPT:-}" && -f "$INIT_CKPT" ]]; then
+        init_ckpt="$INIT_CKPT"
+      elif [[ -n "${INIT_CKPT_DIR:-}" && -d "$INIT_CKPT_DIR" ]]; then
+        init_ckpt="$(get_ckpt_list "$INIT_CKPT_DIR" | head -n 1 || true)"
+      fi
+    else
+      echo "No local checkpoints found; resuming from: $ckpt"
+    fi
   fi
 
   CMD=("${BASE_CMD[@]}")
   if [[ -n "$ckpt" ]]; then
     CMD+=(--resume "$ckpt")
   elif [[ -n "$init_ckpt" ]]; then
-    echo "No 6L checkpoints found; warm-starting from: $init_ckpt"
+    echo "No checkpoints found; warm-starting from: $init_ckpt"
     CMD+=(--init_checkpoint "$init_ckpt")
   fi
 

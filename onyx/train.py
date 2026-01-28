@@ -335,7 +335,53 @@ def _jsonl_record_to_doc(data: Dict[str, Any]) -> Optional[Union[str, Dict[str, 
     chat = data.get("chat")
     if not isinstance(chat, list):
         chat = data.get("chats")
+    if not isinstance(chat, list):
+        chat = data.get("messages")
     if isinstance(chat, list) and chat:
+        # Handle role/content chats: {"chat": [{"role": "user", "content": "..."}, ...]}
+        role_content_msgs: List[Tuple[str, str]] = []
+        for turn in chat:
+            if not isinstance(turn, dict):
+                continue
+            role = turn.get("role") or turn.get("from") or turn.get("speaker")
+            content = turn.get("content") or turn.get("text") or turn.get("value")
+            if not isinstance(role, str) or not isinstance(content, str):
+                continue
+            role = role.strip().lower()
+            content = content.strip()
+            if not content:
+                continue
+            if role in ("system", "user", "assistant"):
+                role_content_msgs.append((role, content))
+
+        if role_content_msgs:
+            turns: List[Dict[str, str]] = []
+            current_style = ""
+            pending_user: Optional[str] = None
+
+            for role, content in role_content_msgs:
+                if role == "system":
+                    current_style = content
+                    continue
+                if role == "user":
+                    pending_user = content
+                    continue
+                if role == "assistant":
+                    if not pending_user:
+                        continue
+                    turns.append({"user": pending_user, "assistant": content, "style": current_style})
+                    pending_user = None
+
+            if turns:
+                if len(turns) == 1:
+                    t = turns[0]
+                    return {"system": t.get("style", ""), "user": t["user"], "assistant": t["assistant"]}
+                return {"chat": turns}
+
+            joined = "\n\n".join([c for _, c in role_content_msgs]).strip()
+            return joined if joined else None
+
+        # Handle paired user/assistant chat turns: {"chat": [{"user": "...", "assistant": "..."}]}
         cleaned: List[Dict[str, str]] = []
         for turn in chat:
             if not isinstance(turn, dict):
@@ -1181,6 +1227,22 @@ class Trainer:
         t = state_dict[key]
         if t.shape == target.shape:
             return
+        # This helper is only intended to handle vocab row-count changes. If the hidden
+        # dimension (d_model) differs, the checkpoint is from a different-sized model.
+        if (
+            t.ndim == 2
+            and target.ndim == 2
+            and t.shape[0] == target.shape[0]
+            and t.shape[1] != target.shape[1]
+            and key in ("embed.weight", "lm_head.weight")
+        ):
+            raise ValueError(
+                f"Cannot load {key}: checkpoint d_model={int(t.shape[1])} vs model d_model={int(target.shape[1])}. "
+                "To warm-start a larger model, first grow the checkpoint with "
+                "`python tools/grow_model_ckpt.py --in_ckpt <small.pt> --out_ckpt <grown.pt> "
+                "--old_config configs/<small>.json --new_config configs/<big>.json` "
+                "and use the grown checkpoint as --init_checkpoint."
+            )
         if t.ndim != target.ndim or t.shape[1:] != target.shape[1:]:
             raise ValueError(f"Cannot resize {key}: ckpt {tuple(t.shape)} vs target {tuple(target.shape)}")
         new_t = torch.zeros_like(target)
@@ -1479,7 +1541,8 @@ class Trainer:
                 self.scaler = torch.amp.GradScaler("cuda")
             elif self.device_type == "mps":
                 try:
-                    self.scaler = torch.amp.GradScaler("mps")
+                    # MPS fp16 can overflow easily; start with a smaller scale than CUDA defaults.
+                    self.scaler = torch.amp.GradScaler("mps", init_scale=2.0**10, growth_interval=2000)
                     self._log("Using GradScaler on MPS.")
                 except Exception as e:
                     self._log(f"GradScaler not available on MPS: {e}", force=True)
@@ -1754,12 +1817,15 @@ class Trainer:
                 bad = self._find_nonfinite_grads()
                 if bad:
                     self._log(f"[NaN] Non-finite grads in: {', '.join(bad)}", force=True)
-                self._nan_tripwire(
-                    "grad_norm",
-                    grad_norm=grad_norm_val,
-                    logits=last_logits,
-                    memory_states=memory_states,
-                )
+                # If we're using GradScaler, allow it to handle transient fp16 overflows by
+                # skipping the optimizer step and reducing the scale, instead of hard-failing.
+                if self.scaler is None:
+                    self._nan_tripwire(
+                        "grad_norm",
+                        grad_norm=grad_norm_val,
+                        logits=last_logits,
+                        memory_states=memory_states,
+                    )
         else:
             grad_norm_val = 0.0
 
@@ -2205,6 +2271,13 @@ def _build_config_from_args(args: argparse.Namespace) -> TrainingConfig:
         log_every=args.log_every,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        monitor_diversity=args.monitor_diversity,
+        monitor_memory_states=args.monitor_memory_states,
+        monitor_every=args.monitor_every,
+        alert_top10_mass=args.alert_top10_mass,
+        alert_entropy_ratio=args.alert_entropy_ratio,
+        alert_effective_vocab=args.alert_effective_vocab,
+        alert_memory_norm=args.alert_memory_norm,
         dry_run=args.dry_run,
         seed=args.seed,
         log_file=args.log_file,
@@ -2323,7 +2396,7 @@ def main():
     p.add_argument("--max_steps", type=int, default=None)
 
     p.add_argument("--learning_rate", type=float, default=3e-4)
-    p.add_argument("--min_lr", type=float, default=1e-5)
+    p.add_argument("--min_lr", type=float, default=1e-4)
     p.add_argument("--memory_lr_scale", type=float, default=0.1)
     p.add_argument("--warmup_steps", type=int, default=50)
     p.add_argument("--warmup_ratio", type=float, default=None, help="Override warmup_steps as ratio of total_steps.")
@@ -2370,6 +2443,15 @@ def main():
     p.add_argument("--flush_logs", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_run_name", type=str, default=None)
+
+    # Monitoring
+    p.add_argument("--monitor_diversity", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--monitor_memory_states", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--monitor_every", type=int, default=0, help="0 = use log_every")
+    p.add_argument("--alert_top10_mass", type=float, default=0.7)
+    p.add_argument("--alert_entropy_ratio", type=float, default=0.3)
+    p.add_argument("--alert_effective_vocab", type=int, default=100)
+    p.add_argument("--alert_memory_norm", type=float, default=100.0)
 
     p.add_argument("--mem_report_every", type=int, default=50)
     p.add_argument("--max_rss_gb", type=float, default=0.0)

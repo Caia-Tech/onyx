@@ -11,6 +11,15 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+try:
+    from torch.compiler import is_compiling as _is_compiling  # torch>=2.1
+except Exception:  # pragma: no cover
+    try:
+        from torch._dynamo import is_compiling as _is_compiling  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover
+        def _is_compiling() -> bool:  # type: ignore[no-redef]
+            return False
+
 
 def sinkhorn_project(matrix: Tensor, iters: int = 10, eps: float = 1e-8) -> Tensor:
     """
@@ -92,30 +101,33 @@ class MHCMixer(nn.Module):
 
     def forward(self, x_streams: Tensor) -> Tensor:
         mix = self._mix_matrix()
-        with torch.no_grad():
-            stats = mix.detach().float().cpu()
-            nan = int(torch.isnan(stats).sum().item())
-            inf = int(torch.isinf(stats).sum().item())
-            finite = torch.isfinite(stats)
-            if finite.any():
-                f = stats[finite]
-                mean = float(f.mean().item())
-                vmax = float(f.max().item())
-                vmin = float(f.min().item())
-            else:
-                mean = float("nan")
-                vmax = float("nan")
-                vmin = float("nan")
-            self.last_P_used_stats = {
-                "shape": tuple(mix.shape),
-                "nan": nan,
-                "inf": inf,
-                "finite": int(finite.sum().item()),
-                "total": int(stats.numel()),
-                "mean": mean,
-                "max": vmax,
-                "min": vmin,
-            }
+        # Avoid torch.compile graph breaks from CPU transfers and scalar .item() logging.
+        # These stats are debug-only; skip them while compiling.
+        if not _is_compiling():
+            with torch.no_grad():
+                stats = mix.detach().float().cpu()
+                nan = int(torch.isnan(stats).sum().item())
+                inf = int(torch.isinf(stats).sum().item())
+                finite = torch.isfinite(stats)
+                if finite.any():
+                    f = stats[finite]
+                    mean = float(f.mean().item())
+                    vmax = float(f.max().item())
+                    vmin = float(f.min().item())
+                else:
+                    mean = float("nan")
+                    vmax = float("nan")
+                    vmin = float("nan")
+                self.last_P_used_stats = {
+                    "shape": tuple(mix.shape),
+                    "nan": nan,
+                    "inf": inf,
+                    "finite": int(finite.sum().item()),
+                    "total": int(stats.numel()),
+                    "mean": mean,
+                    "max": vmax,
+                    "min": vmin,
+                }
         x = x_streams.float()
         mixed = torch.einsum("b s n d, n m -> b s m d", x, mix)
         return mixed.to(dtype=x_streams.dtype)

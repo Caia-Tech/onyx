@@ -4,6 +4,7 @@
 *.bin
 *.safetensors
 checkpoints/
+checkpoints*/
 
 # Datasets
 *.jsonl
@@ -56,8 +57,14 @@ Thumbs.db
 # Logs
 *.log
 logs/
+logs*/
 wandb/
 early_eval_reports/
+
+# Test/artifacts
+.coverage
+.pytest_cache/
+.benchmarks/
 
 # Memory states
 memory_states/
@@ -68,6 +75,9 @@ memory_states/
 
 # Local helpers
 commands.txt
+
+# Local editor/agent settings
+.claude/settings.local.json
 
 # Local tokenizers (trained artifacts)
 tokenizers/

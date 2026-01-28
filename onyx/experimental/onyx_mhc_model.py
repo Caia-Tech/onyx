@@ -348,8 +348,11 @@ class OnyxMHC(nn.Module):
             flat_labels = shift_labels.view(-1)
             valid = flat_labels != -100
             if valid.any():
-                if not torch.isfinite(flat_logits[valid]).all():
-                    raise RuntimeError("Non-finite logits at valid label positions before cross_entropy")
+                # Debug-only: avoid advanced indexing `flat_logits[valid]` which can allocate
+                # a huge temporary (N_valid x vocab) and OOM even on large GPUs.
+                if self._should_check(step):
+                    if not torch.isfinite(shift_logits).all().item():
+                        raise RuntimeError("Non-finite logits before cross_entropy")
                 per_tok = F.cross_entropy(
                     flat_logits,
                     flat_labels,

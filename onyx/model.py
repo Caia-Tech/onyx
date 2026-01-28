@@ -118,8 +118,14 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * norm * self.weight
+        # Keep normalization in fp32 for stability under AMP (especially on MPS).
+        device_type = x.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            xf = x.float()
+            norm = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+            y = xf * norm
+            y = y * self.weight.float()
+        return y.to(dtype=x.dtype)
 
 
 class RotaryEmbedding(nn.Module):
@@ -217,42 +223,49 @@ class ChunkedLinearDeltaMemory(nn.Module):
             nn.init.constant_(self.gate_proj.bias, 2.0)
 
     def _compute_chunk_hyperparams(self, chunk: Tensor, inference_mode: bool) -> Tuple[Tensor, Tensor]:
-        B = chunk.size(0)
-        eps = 1e-6
+        device_type = chunk.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            chunk_f = chunk.float()
+            eps = 1e-6
 
-        def _inv_sigmoid01(p: Tensor) -> Tensor:
-            p = p.clamp(min=eps, max=1.0 - eps)
-            return torch.log(p / (1.0 - p))
+            def _inv_sigmoid01(p: Tensor) -> Tensor:
+                p = p.clamp(min=eps, max=1.0 - eps)
+                return torch.log(p / (1.0 - p))
 
-        if inference_mode:
-            base_eta = self.inference_eta.to(device=chunk.device, dtype=chunk.dtype)
-            base_eta01 = (base_eta / float(self.config.max_memory_lr)).clamp(min=eps, max=1.0 - eps)
-            eta_base_logit = _inv_sigmoid01(base_eta01)
+            if inference_mode:
+                base_eta = self.inference_eta.to(device=chunk.device, dtype=torch.float32)
+                base_eta01 = (base_eta / float(self.config.max_memory_lr)).clamp(min=eps, max=1.0 - eps)
+                eta_base_logit = _inv_sigmoid01(base_eta01)
 
+                min_d = float(self.config.min_memory_decay)
+                base_alpha = self.inference_alpha.to(device=chunk.device, dtype=torch.float32)
+                base_alpha01 = ((base_alpha - min_d) / (1.0 - min_d)).clamp(min=eps, max=1.0 - eps)
+                alpha_base_logit = _inv_sigmoid01(base_alpha01)
+            else:
+                eta_base_logit = torch.tensor(0.0, device=chunk.device, dtype=torch.float32)
+                alpha_base_logit = torch.tensor(0.0, device=chunk.device, dtype=torch.float32)
+
+            eta_raw = eta_base_logit + self.eta_proj(chunk_f)
+            alpha_raw = alpha_base_logit + self.alpha_proj(chunk_f)
+
+            eta_tok = torch.sigmoid(eta_raw) * float(self.config.max_memory_lr)
             min_d = float(self.config.min_memory_decay)
-            base_alpha = self.inference_alpha.to(device=chunk.device, dtype=chunk.dtype)
-            base_alpha01 = ((base_alpha - min_d) / (1.0 - min_d)).clamp(min=eps, max=1.0 - eps)
-            alpha_base_logit = _inv_sigmoid01(base_alpha01)
-        else:
-            eta_base_logit = torch.tensor(0.0, device=chunk.device, dtype=chunk.dtype)
-            alpha_base_logit = torch.tensor(0.0, device=chunk.device, dtype=chunk.dtype)
+            alpha_tok = min_d + torch.sigmoid(alpha_raw) * (1.0 - min_d)
 
-        eta_raw = eta_base_logit + self.eta_proj(chunk)
-        alpha_raw = alpha_base_logit + self.alpha_proj(chunk)
-
-        eta_tok = torch.sigmoid(eta_raw) * self.config.max_memory_lr
-        min_d = self.config.min_memory_decay
-        alpha_tok = min_d + torch.sigmoid(alpha_raw) * (1 - min_d)
-
-        eta = eta_tok.mean(dim=1, keepdim=True)
-        alpha = alpha_tok.mean(dim=1, keepdim=True)
-        return eta, alpha
+            eta = eta_tok.mean(dim=1, keepdim=True)
+            alpha = alpha_tok.mean(dim=1, keepdim=True)
+            return eta, alpha
 
     def init_state(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-        return self.M_init.unsqueeze(0).expand(batch_size, -1, -1).clone().to(device=device, dtype=dtype)
+        # Keep memory state in fp32 even under AMP for stability.
+        return self.M_init.unsqueeze(0).expand(batch_size, -1, -1).clone().to(device=device, dtype=torch.float32)
 
     def retrieve_batch(self, M: Tensor, queries: Tensor) -> Tensor:
-        return torch.bmm(queries, M.transpose(-1, -2))
+        device_type = queries.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            q = queries.float()
+            m = M.float()
+            return torch.bmm(q, m.transpose(-1, -2))
 
     def _process_chunk(
         self,
@@ -263,40 +276,48 @@ class ChunkedLinearDeltaMemory(nn.Module):
         update_memory: bool,
         target_generator: Optional[Callable[[Tensor], Tensor]] = None,
     ) -> Tuple[Tensor, Tensor]:
-        outputs = self.retrieve_batch(M, chunk)
-        if not update_memory:
-            return outputs, M
+        device_type = chunk.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            chunk_f = chunk.float()
+            M_f = M.float()
+            outputs_f = self.retrieve_batch(M_f, chunk_f)
+            if not update_memory:
+                return outputs_f.to(dtype=chunk.dtype), M_f
 
-        keys = normalize_for_delta(chunk, dim=-1, eps=self.config.norm_eps) if self.config.normalize_keys else chunk
+            keys = (
+                normalize_for_delta(chunk_f, dim=-1, eps=self.config.norm_eps)
+                if self.config.normalize_keys
+                else chunk_f
+            )
 
-        k_mean = keys.mean(dim=1)
-        
-        # Feedback Loop Logic
-        if target_generator is not None:
-            targets = target_generator(outputs)
-            v_target = targets.mean(dim=1)
-        else:
-            v_target = outputs.mean(dim=1)
+            k_mean = keys.mean(dim=1)
 
-        if self.config.use_delta_rule:
-            Mk = torch.bmm(M, k_mean.unsqueeze(-1)).squeeze(-1)
-            error = v_target - Mk
-            update = torch.bmm(error.unsqueeze(-1), k_mean.unsqueeze(1))
-        else:
-            update = torch.bmm(v_target.unsqueeze(-1), k_mean.unsqueeze(1))
+            # Feedback Loop Logic
+            if target_generator is not None:
+                targets = target_generator(outputs_f)
+                v_target = targets.float().mean(dim=1)
+            else:
+                v_target = outputs_f.mean(dim=1)
 
-        C = chunk.size(1)
-        chunk_scale = min(C / float(self.chunk_size), 1.0)
-        M_new = alpha * M + eta * chunk_scale * update
+            if self.config.use_delta_rule:
+                Mk = torch.bmm(M_f, k_mean.unsqueeze(-1)).squeeze(-1)
+                error = v_target - Mk
+                update = torch.bmm(error.unsqueeze(-1), k_mean.unsqueeze(1))
+            else:
+                update = torch.bmm(v_target.unsqueeze(-1), k_mean.unsqueeze(1))
 
-        if hasattr(self, "gate_proj"):
-            gate = torch.sigmoid(self.gate_proj(k_mean)).unsqueeze(-1)
-            M_new = gate * M_new + (1 - gate) * M
+            C = int(chunk.size(1))
+            chunk_scale = min(C / float(self.chunk_size), 1.0)
+            M_new = alpha.float() * M_f + eta.float() * float(chunk_scale) * update
 
-        M_norm = torch.norm(M_new, dim=(-2, -1), keepdim=True)
-        scale = torch.clamp(self.config.memory_max_norm / (M_norm + 1e-6), max=1.0)
-        M_new = M_new * scale
-        return outputs, M_new
+            if hasattr(self, "gate_proj"):
+                gate = torch.sigmoid(self.gate_proj(k_mean)).unsqueeze(-1)
+                M_new = gate * M_new + (1.0 - gate) * M_f
+
+            M_norm = torch.norm(M_new, dim=(-2, -1), keepdim=True)
+            scale = torch.clamp(float(self.config.memory_max_norm) / (M_norm + 1e-6), max=1.0)
+            M_new = M_new * scale
+            return outputs_f.to(dtype=chunk.dtype), M_new
 
     def forward(
         self,
@@ -367,12 +388,14 @@ class ChunkedSelfReferentialMemory(nn.Module):
         # Feedback Generator
         def target_gen_fn(retrieved_vals):
             if self.value_gen is not None:
-                base = value_input if value_input is not None else retrieved_vals
-                transformed = self.value_gen(base)
-                # Apply feedback_strength to control loop intensity
-                strength = self.config.feedback_strength
-                return base + strength * transformed
-            return retrieved_vals
+                device_type = retrieved_vals.device.type
+                with torch.autocast(device_type=device_type, enabled=False):
+                    base = value_input if value_input is not None else retrieved_vals
+                    base_f = base.float()
+                    transformed = self.value_gen(base_f)
+                    strength = float(self.config.feedback_strength)
+                    return base_f + strength * transformed
+            return retrieved_vals.float()
 
         outputs, M_new = self.memory(
             x, M, 
@@ -381,7 +404,7 @@ class ChunkedSelfReferentialMemory(nn.Module):
             target_generator=target_gen_fn 
         )
         
-        final_out = target_gen_fn(outputs)
+        final_out = target_gen_fn(outputs).to(dtype=x.dtype)
         return final_out, M_new
 
     def get_memory_reg_loss(self, M: Tensor) -> Tensor:
@@ -601,18 +624,42 @@ class HopeAttention(nn.Module):
                 attn_out = attn_out.reshape(B, S, -1)
         else:
             scale = 1.0 / math.sqrt(self.head_dim)
-            attn = torch.matmul(q, k_exp.transpose(-2, -1)) * scale
+            if x.device.type == "mps":
+                device_type = x.device.type
+                with torch.autocast(device_type=device_type, enabled=False):
+                    qf = q.float()
+                    kf = k_exp.float()
+                    vf = v_exp.float()
+                    attn = torch.matmul(qf, kf.transpose(-2, -1)) * float(scale)
 
-            if kv_cache is None:
-                mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                    if kv_cache is None:
+                        mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                    else:
+                        mask = _causal_mask_with_cache(
+                            S_q=S, S_k=kv_seq_len, device=x.device, position_offset=position_offset
+                        )
+
+                    attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                    attn = F.softmax(attn, dim=-1)
+                    attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
+                    attn_out = torch.matmul(attn, vf)
+
+                attn_out = attn_out.to(dtype=q.dtype).transpose(1, 2).reshape(B, S, -1)
             else:
-                mask = _causal_mask_with_cache(S_q=S, S_k=kv_seq_len, device=x.device, position_offset=position_offset)
+                attn = torch.matmul(q, k_exp.transpose(-2, -1)) * scale
 
-            attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-            attn = F.softmax(attn, dim=-1)
-            attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
-            attn_out = torch.matmul(attn, v_exp)
-            attn_out = attn_out.transpose(1, 2).reshape(B, S, -1)
+                if kv_cache is None:
+                    mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                else:
+                    mask = _causal_mask_with_cache(
+                        S_q=S, S_k=kv_seq_len, device=x.device, position_offset=position_offset
+                    )
+
+                attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                attn = F.softmax(attn, dim=-1)
+                attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
+                attn_out = torch.matmul(attn, v_exp)
+                attn_out = attn_out.transpose(1, 2).reshape(B, S, -1)
 
         out = self.o_proj(attn_out)
         return out, new_memory_states, new_kv_cache
@@ -683,18 +730,42 @@ class StandardAttention(nn.Module):
             attn_out = attn_out.reshape(B, S, -1)
         else:
             scale = 1.0 / math.sqrt(self.head_dim)
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if x.device.type == "mps":
+                device_type = x.device.type
+                with torch.autocast(device_type=device_type, enabled=False):
+                    qf = q.float()
+                    kf = k.float()
+                    vf = v.float()
+                    attn = torch.matmul(qf, kf.transpose(-2, -1)) * float(scale)
 
-            if kv_cache is None:
-                mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                    if kv_cache is None:
+                        mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                    else:
+                        mask = _causal_mask_with_cache(
+                            S_q=S, S_k=kv_seq_len, device=x.device, position_offset=position_offset
+                        )
+
+                    attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                    attn = F.softmax(attn, dim=-1)
+                    attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
+                    attn_out = torch.matmul(attn, vf)
+
+                attn_out = attn_out.to(dtype=q.dtype).transpose(1, 2).reshape(B, S, -1)
             else:
-                mask = _causal_mask_with_cache(S_q=S, S_k=kv_seq_len, device=x.device, position_offset=position_offset)
+                attn = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-            attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-            attn = F.softmax(attn, dim=-1)
-            attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
-            attn_out = torch.matmul(attn, v)
-            attn_out = attn_out.transpose(1, 2).reshape(B, S, -1)
+                if kv_cache is None:
+                    mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                else:
+                    mask = _causal_mask_with_cache(
+                        S_q=S, S_k=kv_seq_len, device=x.device, position_offset=position_offset
+                    )
+
+                attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                attn = F.softmax(attn, dim=-1)
+                attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
+                attn_out = torch.matmul(attn, v)
+                attn_out = attn_out.transpose(1, 2).reshape(B, S, -1)
 
         return self.o_proj(attn_out), {}, new_kv_cache
 
@@ -897,48 +968,49 @@ class Onyx(nn.Module):
 
         loss = None
         if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            flat_logits = shift_logits.view(-1, self.config.vocab_size)
-            flat_labels = shift_labels.view(-1)
-            valid = flat_labels != -100
-            if valid.any():
-                if not torch.isfinite(flat_logits[valid]).all():
-                    raise RuntimeError("Non-finite logits at valid label positions before cross_entropy")
+            # Keep the loss computation in fp32 for numerical stability under AMP/MPS.
+            device_type = logits.device.type
+            with torch.autocast(device_type=device_type, enabled=False):
+                shift_logits = logits[:, :-1, :].contiguous().float()
+                shift_labels = labels[:, 1:].contiguous()
+                flat_logits = shift_logits.view(-1, self.config.vocab_size)
+                flat_labels = shift_labels.view(-1)
+                valid = flat_labels != -100
+                if valid.any():
+                    if not torch.isfinite(flat_logits[valid]).all():
+                        raise RuntimeError("Non-finite logits at valid label positions before cross_entropy")
 
-                # Apply label smoothing if configured
-                if self.config.label_smoothing > 0.0:
-                    smoothing = self.config.label_smoothing
-                    vocab_size = self.config.vocab_size
-                    # Compute log probabilities
-                    log_probs = F.log_softmax(flat_logits, dim=-1)
-                    # Standard cross-entropy component
-                    nll = -log_probs.gather(dim=-1, index=flat_labels.unsqueeze(1)).squeeze(1)
-                    # Smoothing component (uniform over vocab)
-                    smooth_loss = -log_probs.mean(dim=-1)
-                    # Combine: (1-smoothing)*nll + smoothing*smooth_loss
-                    per_tok = (1.0 - smoothing) * nll + smoothing * smooth_loss
+                    # Apply label smoothing if configured
+                    if self.config.label_smoothing > 0.0:
+                        smoothing = float(self.config.label_smoothing)
+                        # Compute log probabilities
+                        log_probs = F.log_softmax(flat_logits, dim=-1)
+                        # Standard cross-entropy component
+                        nll = -log_probs.gather(dim=-1, index=flat_labels.unsqueeze(1)).squeeze(1)
+                        # Smoothing component (uniform over vocab)
+                        smooth_loss = -log_probs.mean(dim=-1)
+                        # Combine: (1-smoothing)*nll + smoothing*smooth_loss
+                        per_tok = (1.0 - smoothing) * nll + smoothing * smooth_loss
+                    else:
+                        # Standard cross-entropy (no smoothing)
+                        per_tok = F.cross_entropy(
+                            flat_logits,
+                            flat_labels,
+                            ignore_index=-100,
+                            reduction="none",
+                        )
+                    denom = valid.sum().clamp(min=1)
+                    loss = per_tok[valid].sum() / denom
+
+                    # Add entropy regularization if configured (encourages diverse predictions)
+                    if self.config.entropy_reg_weight > 0.0:
+                        weight = float(self.config.entropy_reg_weight)
+                        probs = F.softmax(flat_logits[valid], dim=-1)
+                        log_probs = F.log_softmax(flat_logits[valid], dim=-1)
+                        entropy = -(probs * log_probs).sum(dim=-1).mean()
+                        loss = loss - weight * entropy
                 else:
-                    # Standard cross-entropy (no smoothing)
-                    per_tok = F.cross_entropy(
-                        flat_logits,
-                        flat_labels,
-                        ignore_index=-100,
-                        reduction="none",
-                    )
-                denom = valid.sum().clamp(min=1)
-                loss = per_tok[valid].sum() / denom
-
-                # Add entropy regularization if configured (encourages diverse predictions)
-                if self.config.entropy_reg_weight > 0.0:
-                    # Compute entropy: -sum(p * log(p))
-                    probs = F.softmax(flat_logits[valid], dim=-1)
-                    log_probs = F.log_softmax(flat_logits[valid], dim=-1)
-                    entropy = -(probs * log_probs).sum(dim=-1).mean()
-                    # Subtract entropy (we want to maximize it, i.e., minimize negative entropy)
-                    loss = loss - self.config.entropy_reg_weight * entropy
-            else:
-                loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
+                    loss = torch.zeros((), device=logits.device, dtype=torch.float32)
 
         out = {
             "logits": logits,

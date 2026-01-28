@@ -1,0 +1,15 @@
+{
+      "architecture": {
+
+    "d_model": 2048,
+    "n_layers": 16,
+    "n_heads": 16,
+    "n_kv_heads": 2,
+    "d_ff": 8192,
+    "vocab_size": 33760,
+    "max_seq_len": 4096,
+    "tie_embeddings": true,
+    "norm_eps": 1e-5,
+    "rope_base": 500000.0
+    }
+}
