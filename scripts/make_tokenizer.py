@@ -6,15 +6,108 @@ import platform
 import sys
 import time
 import traceback
+import unicodedata
 from glob import glob
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import tokenizers as tokenizers_pkg
 import transformers as transformers_pkg
-from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
+from tokenizers import AddedToken, Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
 from tokenizers.processors import TemplateProcessing
 from transformers import PreTrainedTokenizerFast
+
+
+# ----------------------------
+# Built-in seed tokens (code + logs + JSON glue), conservative-but-useful.
+# These are NOT "special tokens" (they behave like normal tokens).
+# Keep this list reasonably sized to avoid stealing too much vocab budget.
+# ----------------------------
+DEFAULT_SEED_TOKENS: List[str] = [
+    # --- whitespace / structure ---
+    "\n", "\n\n", "\n\n\n",
+    "\r\n",
+    "\t",
+    "  ", "    ",  # 2 and 4 spaces
+    "\n  ", "\n    ", "\n\t",
+
+    # --- JSON / config glue ---
+    '{"', '"}', "{\n", "}\n", "}\n\n",
+    '":', '": ', '",', '", ',
+    '["', '"]',
+    "\\n", "\\t", '\\"', "\\\\",
+    "null", "true", "false",
+
+    # --- common code operators ---
+    "==", "!=", "<=", ">=",
+    "===", "!==",
+    "&&", "||", "??",
+    "->", "=>", "::",
+    "+=", "-=", "*=", "/=", "%=",
+    "++", "--",
+    "<<", ">>",
+    "&=", "|=", "^=",
+    "&&=", "||=",
+
+    # --- comments / docstrings ---
+    "//", "/*", "*/",
+    "# ",
+    '"""', "'''",
+
+    # --- bracket + separator glue ---
+    "();", ");", ");\n",
+    "{}", "{ }",
+    "[]", "[ ]",
+    "()", "( )",
+    "},", "},\n",
+    "];", "];\n",
+    "),", "),\n",
+    "):", "):\n",
+    ":\n", ":\n  ", ":\n    ",  # YAML/Python blocks
+    " = ", " == ", " != ", " <= ", " >= ",
+    " -> ", " => ", " :: ",
+
+    # --- common language-ish punctuation combos ---
+    ".)", ").", ".,", ".\n",
+    ", ", "; ", ": ",
+    " ,", " ;", " :",  # sometimes appears in messy logs/text
+    "...\n", "...",
+
+    # --- paths / urls ---
+    "://", "http://", "https://", "www.",
+    "./", "../",
+    "/usr/", "/etc/", "/var/", "/home/",
+    "C:\\", "\\\\", "\\",
+
+    # --- file extensions (high frequency across code/logs) ---
+    ".json", ".yaml", ".yml", ".toml",
+    ".py", ".ipynb", ".js", ".ts", ".tsx",
+    ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
+    ".rs", ".go", ".java", ".kt", ".swift",
+    ".sh", ".bash", ".zsh",
+    ".md", ".txt", ".log", ".csv",
+
+    # --- logging / error patterns ---
+    "INFO", "WARN", "WARNING", "ERROR", "DEBUG", "TRACE",
+    " INFO ", " WARN ", " ERROR ", " DEBUG ",  # spaced variants common in logs
+    "Exception", "Exception: ",
+    "Traceback (most recent call last):",
+    "Caused by: ",
+    " at ",  # Java-ish
+    "AssertionError", "KeyError", "ValueError", "TypeError", "RuntimeError",
+
+    # --- HTTP-ish (logs) ---
+    "GET ", "POST ", "PUT ", "DELETE ", "PATCH ",
+    "HTTP/1.1", "HTTP/2",
+    " 200 ", " 201 ", " 204 ", " 301 ", " 302 ", " 400 ", " 401 ", " 403 ", " 404 ", " 409 ", " 429 ", " 500 ", " 502 ", " 503 ",
+
+    # --- a few extremely common code keywords WITH trailing space (more useful than bare words) ---
+    "def ", "class ", "return ", "import ", "from ", "as ",
+    "if ", "elif ", "else ", "for ", "while ", "try:", "except ", "finally:",
+    "function ", "const ", "let ", "var ",
+    "public ", "private ", "protected ", "static ",
+    "async ", "await ",
+]
 
 
 def _utc_iso(ts: Optional[float] = None) -> str:
@@ -64,10 +157,7 @@ def resolve_input_files(data_glob: str) -> List[str]:
 
 
 def _extract_text(obj: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-    """Return (kind, text) or None.
-
-    kind is a short label used for reporting.
-    """
+    """Return (kind, text) or None."""
     text = (
         obj.get("text")
         or obj.get("content")
@@ -78,7 +168,6 @@ def _extract_text(obj: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     if isinstance(text, str) and text.strip():
         return ("text_field", text)
 
-    # Common instruct datasets: {"prompt": "...", "completion": "..."}
     prompt = obj.get("prompt")
     completion = obj.get("completion")
     if isinstance(prompt, str) and isinstance(completion, str):
@@ -87,7 +176,6 @@ def _extract_text(obj: Dict[str, Any]) -> Optional[Tuple[str, str]]:
         if p and c:
             return ("prompt_completion", f"{p}\n{c}")
 
-    # Single-turn chat: {"user": "...", "assistant": "...", "system": "..."}
     user = obj.get("user")
     assistant = obj.get("assistant")
     system = obj.get("system", "")
@@ -104,11 +192,6 @@ def _extract_text(obj: Dict[str, Any]) -> Optional[Tuple[str, str]]:
                 )
             return ("user_assistant", f"User: {user}\nAssistant: {assistant}")
 
-    # Multi-turn chat: {"chat": [...]}
-    # Supports multiple common shapes:
-    # - {"user": "...", "assistant": "..."}
-    # - {"role": "user"|"assistant"|..., "content": "..."}
-    # - {"from": "human"|"gpt"|..., "value": "..."}
     chat = obj.get("chat")
     if isinstance(chat, list):
         parts: List[str] = []
@@ -132,7 +215,6 @@ def _extract_text(obj: Dict[str, Any]) -> Optional[Tuple[str, str]]:
         if parts:
             return ("chat_list", "\n".join(parts))
 
-    # OpenAI-ish chat format: {"messages": [{"role": "user", "content": "..."}, ...]}
     messages = obj.get("messages")
     if isinstance(messages, list):
         parts = []
@@ -150,12 +232,81 @@ def _extract_text(obj: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _clean_text(text: str, normalize: str) -> str:
+    """Avoid learning garbage tokens: normalize (optional) + drop most control chars (keep \\n and \\t)."""
+    if normalize == "nfkc":
+        text = unicodedata.normalize("NFKC", text)
+
+    out_chars: List[str] = []
+    for ch in text:
+        if ch in ("\n", "\t"):
+            out_chars.append(ch)
+            continue
+        cat = unicodedata.category(ch)
+        if cat.startswith("C"):  # control/surrogate/private-use/etc.
+            continue
+        out_chars.append(ch)
+    return "".join(out_chars)
+
+
+def _replacement_frac(text: str) -> float:
+    if not text:
+        return 1.0
+    return text.count("\uFFFD") / len(text)
+
+
+def _unescape_seed_token(t: str) -> str:
+    # Minimal unescape so a file can contain "\n" and "\t" literals.
+    # We do NOT do full python unicode-escape (keeps this predictable).
+    return (
+        t.replace("\\r\\n", "\r\n")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\r", "\r")
+        .replace("\\\\", "\\")
+    )
+
+
+def _load_seed_tokens(path: str, *, unescape: bool) -> List[str]:
+    toks: List[str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.rstrip("\n")
+            if not raw:
+                continue
+            s = raw.lstrip()
+            if s.startswith("#"):
+                continue
+            toks.append(_unescape_seed_token(raw) if unescape else raw)
+
+    # stable unique preserving order
+    seen = set()
+    out: List[str] = []
+    for t in toks:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+
+def _stable_unique(seq: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for t in seq:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+
 class CorpusIterator:
     def __init__(
         self,
         files: List[str],
         report: Dict[str, Any],
         *,
+        normalize: str,
+        max_replacement_frac: float,
         max_text_samples: int,
         max_dropped_samples: int,
         truncate_chars: int,
@@ -163,6 +314,8 @@ class CorpusIterator:
     ) -> None:
         self._files = files
         self._report = report
+        self._normalize = normalize
+        self._max_replacement_frac = max_replacement_frac
         self._max_text_samples = max_text_samples
         self._max_dropped_samples = max_dropped_samples
         self._truncate_chars = truncate_chars
@@ -247,6 +400,26 @@ class CorpusIterator:
                         self._note_dropped(path, line_no, "empty_text", raw)
                         continue
 
+                    text = _clean_text(text, self._normalize).strip()
+                    if not text:
+                        pf["no_text"] += 1
+                        totals["no_text"] += 1
+                        self._note_dropped(path, line_no, "empty_after_clean", raw)
+                        continue
+
+                    if self._max_replacement_frac > 0:
+                        frac = _replacement_frac(text)
+                        if frac > self._max_replacement_frac:
+                            pf["no_text"] += 1
+                            totals["no_text"] += 1
+                            self._note_dropped(
+                                path,
+                                line_no,
+                                f"too_many_replacement_chars:{frac:.4f}",
+                                raw,
+                            )
+                            continue
+
                     pf["yielded"] += 1
                     totals["yielded"] += 1
                     pf["kinds"][kind] = pf["kinds"].get(kind, 0) + 1
@@ -266,12 +439,10 @@ class CorpusIterator:
                     yield text
 
 
-def build_tokenizer(normalize: str, add_prefix_space: bool) -> Tokenizer:
-    tok = Tokenizer(models.BPE(unk_token="[UNK]"))
-
+def build_tokenizer(normalize: str, add_prefix_space: bool, bpe_dropout: float) -> Tokenizer:
+    tok = Tokenizer(models.BPE(unk_token="[UNK]", dropout=bpe_dropout))
     if normalize == "nfkc":
         tok.normalizer = normalizers.Sequence([normalizers.NFKC()])
-
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=add_prefix_space)
     tok.decoder = decoders.ByteLevel()
     return tok
@@ -281,14 +452,28 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_glob", required=True, help="Path, directory, or glob for .jsonl")
     ap.add_argument("--out_dir", required=True)
-    ap.add_argument("--vocab_size", type=int, default=4096)
-    ap.add_argument("--min_frequency", type=int, default=2)
+
+    # Key knobs for “more general” tokenizers:
+    ap.add_argument("--vocab_size", type=int, default=8192)
+    ap.add_argument("--min_frequency", type=int, default=5)
+    ap.add_argument(
+        "--bpe_dropout",
+        type=float,
+        default=0.0,
+        help="BPE dropout for subword regularization (try 0.05-0.2 for training; use 0.0 for deterministic)",
+    )
+    ap.add_argument(
+        "--max_replacement_frac",
+        type=float,
+        default=0.01,
+        help="Drop samples where U+FFFD replacement-char fraction exceeds this (0 disables)",
+    )
 
     ap.add_argument(
         "--normalize",
         choices=["none", "nfkc"],
         default="nfkc",
-        help="Unicode normalization (use 'none' for code-heavy corpora)",
+        help="Unicode normalization (use 'none' for very code-heavy corpora)",
     )
     ap.add_argument("--add_prefix_space", action="store_true", default=True)
     ap.add_argument(
@@ -301,6 +486,37 @@ def main() -> None:
         "--add_bos_eos",
         action="store_true",
         help="Add a post-processor that inserts [BOS]/[EOS] around sequences",
+    )
+
+    # Seeding
+    ap.add_argument(
+        "--seed_builtin",
+        action="store_true",
+        default=True,
+        help="Add built-in seed tokens for code/logs/JSON glue (default: on)",
+    )
+    ap.add_argument(
+        "--no_seed_builtin",
+        action="store_false",
+        dest="seed_builtin",
+        help="Disable built-in seed tokens",
+    )
+    ap.add_argument(
+        "--seed_tokens",
+        default=None,
+        help="Path to newline-delimited extra seed tokens (optional). Lines starting with # are ignored.",
+    )
+    ap.add_argument(
+        "--seed_unescape",
+        action="store_true",
+        default=True,
+        help=r"Unescape \n \t \r \\ sequences in --seed_tokens file (default: on)",
+    )
+    ap.add_argument(
+        "--no_seed_unescape",
+        action="store_false",
+        dest="seed_unescape",
+        help="Disable unescaping for --seed_tokens file",
     )
 
     ap.add_argument(
@@ -329,9 +545,14 @@ def main() -> None:
             "out_dir": str(out_dir),
             "vocab_size": args.vocab_size,
             "min_frequency": args.min_frequency,
+            "bpe_dropout": args.bpe_dropout,
+            "max_replacement_frac": args.max_replacement_frac,
             "normalize": args.normalize,
             "add_prefix_space": bool(args.add_prefix_space),
             "add_bos_eos": bool(args.add_bos_eos),
+            "seed_builtin": bool(args.seed_builtin),
+            "seed_tokens": args.seed_tokens,
+            "seed_unescape": bool(args.seed_unescape),
             "report_path": str(report_path),
             "status_every": args.status_every,
             "report_max_text_samples": args.report_max_text_samples,
@@ -346,10 +567,7 @@ def main() -> None:
             "tokenizers_version": getattr(tokenizers_pkg, "__version__", None),
             "transformers_version": getattr(transformers_pkg, "__version__", None),
         },
-        "input": {
-            "files": [],
-            "file_info": [],
-        },
+        "input": {"files": [], "file_info": []},
         "corpus": {
             "totals": {
                 "lines_total": 0,
@@ -385,13 +603,12 @@ def main() -> None:
         files = resolve_input_files(args.data_glob)
         report["input"]["files"] = files
         report["input"]["file_info"] = [_file_info(p) for p in files]
-
         if not files:
             raise SystemExit(f"No input files matched: {args.data_glob}")
 
         special_tokens = ["[PAD]", "[UNK]", "[BOS]", "[EOS]"]
 
-        tok = build_tokenizer(args.normalize, args.add_prefix_space)
+        tok = build_tokenizer(args.normalize, args.add_prefix_space, args.bpe_dropout)
         trainer = trainers.BpeTrainer(
             vocab_size=args.vocab_size,
             min_frequency=args.min_frequency,
@@ -403,6 +620,8 @@ def main() -> None:
         corpus_iter = CorpusIterator(
             files,
             report,
+            normalize=args.normalize,
+            max_replacement_frac=args.max_replacement_frac,
             max_text_samples=args.report_max_text_samples,
             max_dropped_samples=args.report_max_dropped_samples,
             truncate_chars=args.report_truncate_chars,
@@ -411,16 +630,25 @@ def main() -> None:
 
         tok.train_from_iterator(corpus_iter, trainer=trainer)
 
+        # Add seed tokens AFTER training as normal AddedTokens (NOT special tokens).
+        # Note: this will increase vocab size beyond args.vocab_size; that’s expected.
+        seed_tokens: List[str] = []
+        if args.seed_builtin:
+            seed_tokens.extend(DEFAULT_SEED_TOKENS)
+        if args.seed_tokens:
+            seed_tokens.extend(_load_seed_tokens(args.seed_tokens, unescape=args.seed_unescape))
+        seed_tokens = _stable_unique(seed_tokens)
+
+        if seed_tokens:
+            added = [AddedToken(t, normalized=False, special=False) for t in seed_tokens]
+            tok.add_tokens(added)
+
         if args.add_bos_eos:
             bos_id = tok.token_to_id("[BOS]")
             eos_id = tok.token_to_id("[EOS]")
             if bos_id is None or eos_id is None:
                 report["warnings"].append(
-                    {
-                        "type": "missing_special_token_ids",
-                        "bos_id": bos_id,
-                        "eos_id": eos_id,
-                    }
+                    {"type": "missing_special_token_ids", "bos_id": bos_id, "eos_id": eos_id}
                 )
             else:
                 tok.post_processor = TemplateProcessing(
@@ -437,12 +665,11 @@ def main() -> None:
             eos_token="[EOS]",
         )
         hf_tok.clean_up_tokenization_spaces = False
-
         hf_tok.save_pretrained(out_dir)
 
         saved_files = sorted(p.name for p in out_dir.iterdir() if p.is_file())
-
         vocab = hf_tok.get_vocab()
+
         report["tokenizer"] = {
             "type": "bytelevel_bpe",
             "normalize": args.normalize,
@@ -451,6 +678,8 @@ def main() -> None:
             "vocab_size_target": args.vocab_size,
             "vocab_size_actual": len(hf_tok),
             "min_frequency": args.min_frequency,
+            "bpe_dropout": args.bpe_dropout,
+            "max_replacement_frac": args.max_replacement_frac,
             "special_tokens": special_tokens,
             "special_token_ids": {
                 "pad": hf_tok.pad_token_id,
@@ -459,6 +688,10 @@ def main() -> None:
                 "eos": hf_tok.eos_token_id,
             },
             "special_tokens_in_vocab": {t: (t in vocab) for t in special_tokens},
+            "seed_tokens_builtin": bool(args.seed_builtin),
+            "seed_tokens_path": args.seed_tokens,
+            "seed_tokens_count": len(seed_tokens),
+            "seed_tokens_preview": seed_tokens[:40],
             "saved_files": saved_files,
             "sanity_samples": [],
         }
@@ -469,6 +702,9 @@ def main() -> None:
             "naïve café",
             "x = 1_000_000 # comment",
             "{" + '"k"' + ": " + '"v"' + "}",
+            "Traceback (most recent call last):\n  File \"x.py\", line 1\n    raise ValueError(\"bad\")",
+            "GET /api/v1/items?id=123 HTTP/1.1\nHost: example.com\n",
+            "if (a != b && c <= d) { return a->x::y; }",
         ]
         for s in sample_texts:
             enc = hf_tok(s)
@@ -476,12 +712,7 @@ def main() -> None:
             toks = hf_tok.convert_ids_to_tokens(ids) if isinstance(ids, list) else None
             decoded = hf_tok.decode(ids) if isinstance(ids, list) else None
             report["tokenizer"]["sanity_samples"].append(
-                {
-                    "text": s,
-                    "input_ids": ids,
-                    "tokens": toks,
-                    "decoded": decoded,
-                }
+                {"text": s, "input_ids": ids, "tokens": toks, "decoded": decoded}
             )
 
         report["status"] = "ok"
@@ -493,6 +724,7 @@ def main() -> None:
             f"PAD={hf_tok.pad_token_id} UNK={hf_tok.unk_token_id} "
             f"BOS={hf_tok.bos_token_id} EOS={hf_tok.eos_token_id}"
         )
+        print(f"Seed tokens added: {len(seed_tokens)} (builtin={args.seed_builtin}, file={bool(args.seed_tokens)})")
         print(f"Wrote report to: {report_path}")
 
     except SystemExit as e:
@@ -503,11 +735,7 @@ def main() -> None:
     except Exception as e:
         report["status"] = "error"
         report["errors"].append(
-            {
-                "type": type(e).__name__,
-                "message": str(e),
-                "traceback": traceback.format_exc(),
-            }
+            {"type": type(e).__name__, "message": str(e), "traceback": traceback.format_exc()}
         )
         write_report()
         raise

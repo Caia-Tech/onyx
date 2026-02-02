@@ -22,9 +22,9 @@ LOG_EVERY="${LOG_EVERY:-100}"
 MONITOR_EVERY="${MONITOR_EVERY:-100}"          # 0 = follow log_every
 ALERT_EFFECTIVE_VOCAB="${ALERT_EFFECTIVE_VOCAB:-100}"
 MEM_REPORT_EVERY="${MEM_REPORT_EVERY:-100}"
-PEAK_LR="${PEAK_LR:-5e-4}"
-MIN_LR="${MIN_LR:-2e-4}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.001}"
+PEAK_LR="${PEAK_LR:-1e-4}"
+MIN_LR="${MIN_LR:-2e-5}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.01}"
 LOCK_DIR="${CKPT_DIR}/.train_autoresume.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 
@@ -42,7 +42,7 @@ if [[ ! -e "$DATA_GLOB" ]]; then
   echo "DATA_GLOB not found: $DATA_GLOB" >&2
   exit 2
 fi
-if [[ ! -d "/Users/owner/Desktop/caiatech/datasets/tokenizers/onyx-tokenizer" ]]; then
+if [[ ! -d "/Users/owner/Desktop/caiatech/datasets/tokenizers/byte_eos" ]]; then
   echo "Tokenizer dir not found" >&2
   exit 2
 fi
@@ -72,11 +72,11 @@ trap cleanup_lock EXIT
 BASE_CMD=(
   python -m onyx.train
   --data_glob "$DATA_GLOB"
-  --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizers/onyx-tokenizer"
+  --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizers/byte_eos"
   --model_config "$MODEL_CONFIG"
-  --batch_size 64
-  --max_seq_len 256
-  --tokens_per_step 8192
+  --batch_size 2
+  --max_seq_len 8192
+  --tokens_per_step 16384
   --shuffle_buffer_docs "$SHUFFLE_BUFFER_DOCS"
   --num_epochs 1
   --learning_rate "$PEAK_LR"
@@ -85,8 +85,8 @@ BASE_CMD=(
   --amp
   --amp_dtype "$AMP_DTYPE"
   --save_dir "$CKPT_DIR"
-  --save_every_steps 1000
-  --train_tokens_target 30000000000
+  --save_every_steps 500
+  --train_tokens_target 7536720684
   --log_every "$LOG_EVERY"
   --monitor_every "$MONITOR_EVERY"
   --alert_effective_vocab "$ALERT_EFFECTIVE_VOCAB"

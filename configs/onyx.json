@@ -1,12 +1,12 @@
 {
     "architecture": {
-        "d_model": 64,
-        "n_layers": 1,
+        "d_model": 96,
+        "n_layers": 4,
         "n_heads": 2,
         "n_kv_heads": 1,
-        "d_ff": 256,
-        "vocab_size": 260,
-        "max_seq_len": 256,
+        "d_ff": 2560,
+        "vocab_size": 256,
+        "max_seq_len": 257,
         "rope_base": 500000.0,
         "norm_eps": 1e-05
     }
