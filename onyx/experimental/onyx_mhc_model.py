@@ -170,6 +170,8 @@ class OnyxMHC(nn.Module):
         inference_mode: bool,
         cu_seqlens: Optional[Tensor],
         max_seqlen: Optional[int],
+        packed_cu_seqlens: Optional[Tensor],
+        packed_num_segs: Optional[Tensor],
         kv_cache: Optional[Dict[str, Any]],
         position_offset: int,
         *,
@@ -188,6 +190,8 @@ class OnyxMHC(nn.Module):
             inference_mode=inference_mode,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            packed_cu_seqlens=packed_cu_seqlens,
+            packed_num_segs=packed_num_segs,
             kv_cache=layer_kv_cache,
             position_offset=position_offset,
         )
@@ -254,6 +258,8 @@ class OnyxMHC(nn.Module):
         return_memory_reg_loss: bool = False,
         cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
+        packed_cu_seqlens: Optional[Tensor] = None,
+        packed_num_segs: Optional[Tensor] = None,
         kv_cache: Optional[List[Optional[Dict[str, Any]]]] = None,
         position_offset: int = 0,
     ) -> Dict[str, Any]:
@@ -282,7 +288,7 @@ class OnyxMHC(nn.Module):
 
             if self.gradient_checkpointing and self.training:
                 x_out, new_mem, new_kv = torch.utils.checkpoint.checkpoint(
-                    lambda x_in, mem, upd, inf, cu, mx, kv, pos: self._block_forward(
+                    lambda x_in, mem, upd, inf, cu, mx, pcu, pns, kv, pos: self._block_forward(
                         layer,
                         x_in,
                         mem,
@@ -290,6 +296,8 @@ class OnyxMHC(nn.Module):
                         inf,
                         cu,
                         mx,
+                        pcu,
+                        pns,
                         kv,
                         pos,
                         layer_idx=i,
@@ -301,6 +309,8 @@ class OnyxMHC(nn.Module):
                     inference_mode,
                     cu_seqlens,
                     max_seqlen,
+                    packed_cu_seqlens,
+                    packed_num_segs,
                     kv_cache[i],
                     position_offset,
                     use_reentrant=False,
@@ -314,6 +324,8 @@ class OnyxMHC(nn.Module):
                     inference_mode,
                     cu_seqlens,
                     max_seqlen,
+                    packed_cu_seqlens,
+                    packed_num_segs,
                     kv_cache[i],
                     position_offset,
                     layer_idx=i,
