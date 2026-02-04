@@ -1,0 +1,1 @@
+{"d_model": 32, "n_layers": 2, "n_heads": 4, "n_kv_heads": 2, "head_dim": 8, "d_ff": 64, "max_seq_len": 16, "train_seq_len": 16, "vocab_size": 128, "use_flash_attention": false, "dropout": 0.0, "attention_dropout": 0.0, "use_hope_attention": true}
