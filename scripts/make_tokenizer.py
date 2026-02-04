@@ -17,6 +17,14 @@ from tokenizers import AddedToken, Tokenizer, decoders, models, normalizers, pre
 from tokenizers.processors import TemplateProcessing
 from transformers import PreTrainedTokenizerFast
 
+# Optional: best-in-class mojibake repair (recommended)
+try:
+    import ftfy  # type: ignore
+    _HAVE_FTFY = True
+except Exception:
+    ftfy = None
+    _HAVE_FTFY = False
+
 
 # ----------------------------
 # Built-in seed tokens (code + logs + JSON glue), conservative-but-useful.
@@ -232,27 +240,107 @@ def _extract_text(obj: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _clean_text(text: str, normalize: str) -> str:
-    """Avoid learning garbage tokens: normalize (optional) + drop most control chars (keep \\n and \\t)."""
+def _replacement_frac(text: str) -> float:
+    if not text:
+        return 1.0
+    return text.count("\uFFFD") / len(text)
+
+
+# Common mojibake fragments from cp1252/latin1 mis-decoding of UTF-8
+_MOJIBAKE_TRIGGERS = (
+    "â€™", "â€œ", "â€�", "â€“", "â€”", "â€¦", "â€",
+    "Ã", "Â",
+    "ï¿½",  # sometimes shows up as a literal sequence
+)
+
+def _mojibake_score(s: str) -> int:
+    # Lower is better
+    rep = s.count("\uFFFD")
+    trig = sum(s.count(t) for t in _MOJIBAKE_TRIGGERS)
+    # Penalize lots of isolated high chars a bit (still allow real languages)
+    hi = sum(1 for ch in s if ord(ch) >= 0x80)
+    return rep * 10000 + trig * 200 + hi
+
+def _try_redecode(s: str, src_enc: str) -> Optional[str]:
+    try:
+        b = s.encode(src_enc, errors="strict")
+    except Exception:
+        return None
+    try:
+        return b.decode("utf-8", errors="strict")
+    except Exception:
+        return None
+
+def _fix_mojibake(text: str, mode: str) -> str:
+    """
+    Fix obvious mojibake while avoiding wrecking valid non-English text.
+    Modes:
+      - "auto": ftfy if available, else heuristic re-decode selection
+      - "ftfy": use ftfy.fix_text (if installed) else fallback heuristic
+      - "heuristic": compare a few re-decodes and keep best-scoring
+      - "off": do nothing
+    """
+    if mode == "off":
+        return text
+
+    candidates = [text]
+
+    if mode in ("auto", "ftfy") and _HAVE_FTFY and ftfy is not None:
+        try:
+            candidates.append(ftfy.fix_text(text))
+        except Exception:
+            pass
+
+    if mode in ("auto", "heuristic", "ftfy"):
+        # Common salvage attempts for cp1252/latin1 display of UTF-8 bytes
+        for enc in ("cp1252", "latin1"):
+            red = _try_redecode(text, enc)
+            if red is not None:
+                candidates.append(red)
+
+    # Pick the best by score (but only switch if it meaningfully improves)
+    best = min(candidates, key=_mojibake_score)
+    if _mojibake_score(best) + 50 < _mojibake_score(text):
+        return best
+    return text
+
+
+def _clean_text(
+    text: str,
+    normalize: str,
+    *,
+    fix_mojibake_mode: str,
+    drop_combining_marks: bool,
+) -> str:
+    """
+    Normalize (optional) + fix mojibake (optional) + drop control/private-use/surrogate chars.
+    Keep \\n and \\t.
+    """
     if normalize == "nfkc":
         text = unicodedata.normalize("NFKC", text)
+
+    # Repair common mojibake that survives JSON decoding (â€™ etc.)
+    text = _fix_mojibake(text, fix_mojibake_mode)
 
     out_chars: List[str] = []
     for ch in text:
         if ch in ("\n", "\t"):
             out_chars.append(ch)
             continue
+
         cat = unicodedata.category(ch)
-        if cat.startswith("C"):  # control/surrogate/private-use/etc.
+
+        # Drop control/surrogate/private-use/unassigned etc.
+        if cat.startswith("C"):
             continue
+
+        # Optional: drop combining marks (can reduce “zalgo” / junk)
+        if drop_combining_marks and cat in ("Mn", "Me"):
+            continue
+
         out_chars.append(ch)
+
     return "".join(out_chars)
-
-
-def _replacement_frac(text: str) -> float:
-    if not text:
-        return 1.0
-    return text.count("\uFFFD") / len(text)
 
 
 def _unescape_seed_token(t: str) -> str:
@@ -306,6 +394,8 @@ class CorpusIterator:
         report: Dict[str, Any],
         *,
         normalize: str,
+        fix_mojibake_mode: str,
+        drop_combining_marks: bool,
         max_replacement_frac: float,
         max_text_samples: int,
         max_dropped_samples: int,
@@ -315,6 +405,8 @@ class CorpusIterator:
         self._files = files
         self._report = report
         self._normalize = normalize
+        self._fix_mojibake_mode = fix_mojibake_mode
+        self._drop_combining_marks = drop_combining_marks
         self._max_replacement_frac = max_replacement_frac
         self._max_text_samples = max_text_samples
         self._max_dropped_samples = max_dropped_samples
@@ -400,7 +492,12 @@ class CorpusIterator:
                         self._note_dropped(path, line_no, "empty_text", raw)
                         continue
 
-                    text = _clean_text(text, self._normalize).strip()
+                    text = _clean_text(
+                        text,
+                        self._normalize,
+                        fix_mojibake_mode=self._fix_mojibake_mode,
+                        drop_combining_marks=self._drop_combining_marks,
+                    ).strip()
                     if not text:
                         pf["no_text"] += 1
                         totals["no_text"] += 1
@@ -488,6 +585,32 @@ def main() -> None:
         help="Add a post-processor that inserts [BOS]/[EOS] around sequences",
     )
 
+    # Mojibake + junk unicode control
+    ap.add_argument(
+        "--fix_mojibake",
+        action="store_true",
+        default=True,
+        help="Attempt to repair common mojibake (â€™ etc). Uses ftfy if available. (default: on)",
+    )
+    ap.add_argument(
+        "--no_fix_mojibake",
+        action="store_false",
+        dest="fix_mojibake",
+        help="Disable mojibake repair",
+    )
+    ap.add_argument(
+        "--mojibake_mode",
+        choices=["auto", "ftfy", "heuristic", "off"],
+        default="auto",
+        help="Mojibake repair mode. auto=ftfy if installed else heuristic.",
+    )
+    ap.add_argument(
+        "--drop_combining_marks",
+        action="store_true",
+        default=False,
+        help="Drop Unicode combining marks (helps reduce zalgo/junk). Off by default.",
+    )
+
     # Seeding
     ap.add_argument(
         "--seed_builtin",
@@ -550,6 +673,9 @@ def main() -> None:
             "normalize": args.normalize,
             "add_prefix_space": bool(args.add_prefix_space),
             "add_bos_eos": bool(args.add_bos_eos),
+            "fix_mojibake": bool(args.fix_mojibake),
+            "mojibake_mode": args.mojibake_mode,
+            "drop_combining_marks": bool(args.drop_combining_marks),
             "seed_builtin": bool(args.seed_builtin),
             "seed_tokens": args.seed_tokens,
             "seed_unescape": bool(args.seed_unescape),
@@ -566,6 +692,7 @@ def main() -> None:
             "cwd": os.getcwd(),
             "tokenizers_version": getattr(tokenizers_pkg, "__version__", None),
             "transformers_version": getattr(transformers_pkg, "__version__", None),
+            "ftfy_available": _HAVE_FTFY,
         },
         "input": {"files": [], "file_info": []},
         "corpus": {
@@ -621,6 +748,8 @@ def main() -> None:
             files,
             report,
             normalize=args.normalize,
+            fix_mojibake_mode=(args.mojibake_mode if args.fix_mojibake else "off"),
+            drop_combining_marks=args.drop_combining_marks,
             max_replacement_frac=args.max_replacement_frac,
             max_text_samples=args.report_max_text_samples,
             max_dropped_samples=args.report_max_dropped_samples,
@@ -670,6 +799,10 @@ def main() -> None:
         saved_files = sorted(p.name for p in out_dir.iterdir() if p.is_file())
         vocab = hf_tok.get_vocab()
 
+        # Byte fallback sanity: ensure ByteLevel alphabet chars exist in vocab (should be true)
+        bl_alphabet = pre_tokenizers.ByteLevel.alphabet()
+        missing_alphabet = [ch for ch in bl_alphabet if tok.token_to_id(ch) is None]
+
         report["tokenizer"] = {
             "type": "bytelevel_bpe",
             "normalize": args.normalize,
@@ -693,6 +826,11 @@ def main() -> None:
             "seed_tokens_count": len(seed_tokens),
             "seed_tokens_preview": seed_tokens[:40],
             "saved_files": saved_files,
+            "byte_fallback_sanity": {
+                "bytelevel_alphabet_len": len(bl_alphabet),
+                "missing_bytelevel_alphabet_tokens": missing_alphabet[:50],
+                "missing_count": len(missing_alphabet),
+            },
             "sanity_samples": [],
         }
 
@@ -705,6 +843,7 @@ def main() -> None:
             "Traceback (most recent call last):\n  File \"x.py\", line 1\n    raise ValueError(\"bad\")",
             "GET /api/v1/items?id=123 HTTP/1.1\nHost: example.com\n",
             "if (a != b && c <= d) { return a->x::y; }",
+            "Bill said: “don’t do that” — and left…",
         ]
         for s in sample_texts:
             enc = hf_tok(s)
@@ -724,7 +863,12 @@ def main() -> None:
             f"PAD={hf_tok.pad_token_id} UNK={hf_tok.unk_token_id} "
             f"BOS={hf_tok.bos_token_id} EOS={hf_tok.eos_token_id}"
         )
+        print(
+            f"Mojibake fix: enabled={args.fix_mojibake} mode={args.mojibake_mode} "
+            f"(ftfy_available={_HAVE_FTFY})"
+        )
         print(f"Seed tokens added: {len(seed_tokens)} (builtin={args.seed_builtin}, file={bool(args.seed_tokens)})")
+        print(f"ByteLevel alphabet missing tokens: {len(missing_alphabet)}")
         print(f"Wrote report to: {report_path}")
 
     except SystemExit as e:

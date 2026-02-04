@@ -96,6 +96,8 @@ class OnyxConfig:
     cms_base_chunk: int = 32
     cms_chunk_multiplier: int = 2
     cms_aggregation: str = "learned"
+    cms_update_every_base_steps: int = 1
+    cms_update_every_multiplier: int = 2
 
     # === M3 Optimizer defaults ===
     m3_beta_slow: float = 0.99
@@ -469,6 +471,56 @@ def _causal_mask_with_cache(S_q: int, S_k: int, device: torch.device, position_o
     k_pos = torch.arange(S_k, device=device).unsqueeze(0)
     return k_pos > q_pos
 
+def build_packed_causal_mask(boundaries: Tensor, S: int, device: torch.device) -> Tensor:
+    """
+    boundaries: 1D int tensor like [0, a, b, ..., S]
+    returns mask bool [S, S], where True means "mask out"
+    - standard causal within each segment
+    - mask everything outside segment
+    """
+    b = boundaries.to(device=device)
+    b = b[b >= 0]
+    if b.numel() == 0 or int(b[0]) != 0:
+        b = torch.cat([torch.tensor([0], device=device, dtype=torch.int32), b])
+    if int(b[-1]) != S:
+        b = torch.cat([b, torch.tensor([S], device=device, dtype=torch.int32)])
+
+    b = torch.clamp(b, 0, S)
+
+    seg_id = torch.full((S,), -1, device=device, dtype=torch.int32)
+    for i in range(b.numel() - 1):
+        start = int(b[i].item())
+        end = int(b[i + 1].item())
+        if end <= start:
+            continue
+        start = max(0, start)
+        end = min(S, end)
+        seg_id[start:end] = i
+
+    qpos = torch.arange(S, device=device).unsqueeze(1)
+    kpos = torch.arange(S, device=device).unsqueeze(0)
+    causal = kpos > qpos
+    seg_mismatch = seg_id.unsqueeze(1) != seg_id.unsqueeze(0)
+    return causal | seg_mismatch
+
+
+def _build_batch_packed_mask(
+    packed_cu_seqlens: Tensor,
+    packed_num_segs: Optional[Tensor],
+    S: int,
+    device: torch.device,
+) -> Tensor:
+    masks: List[Tensor] = []
+    B = packed_cu_seqlens.shape[0]
+    for b in range(B):
+        if packed_num_segs is not None:
+            n = int(packed_num_segs[b].item())
+            boundaries = packed_cu_seqlens[b, :n]
+        else:
+            boundaries = packed_cu_seqlens[b]
+        masks.append(build_packed_causal_mask(boundaries, S, device))
+    return torch.stack(masks, dim=0)
+
 class HopeAttention(nn.Module):
     def __init__(self, config: OnyxConfig, layer_idx: int = 0):
         super().__init__()
@@ -528,6 +580,8 @@ class HopeAttention(nn.Module):
         inference_mode: bool = False,
         cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
+        packed_cu_seqlens: Optional[Tensor] = None,
+        packed_num_segs: Optional[Tensor] = None,
         kv_cache: Optional[Dict[str, Tensor]] = None,
         position_offset: int = 0,
     ) -> Tuple[Tensor, Dict[str, Tensor], Optional[Dict[str, Tensor]]]:
@@ -619,10 +673,15 @@ class HopeAttention(nn.Module):
                     causal=True,
                 )
                 attn_out = attn_out.reshape(B, S, -1)
-            else:
+            elif packed_cu_seqlens is None:
                 attn_out = flash_attn_func(q.transpose(1, 2), k_exp.transpose(1, 2), v_exp.transpose(1, 2), causal=True)
                 attn_out = attn_out.reshape(B, S, -1)
+            else:
+                attn_out = None
         else:
+            attn_out = None
+
+        if attn_out is None:
             scale = 1.0 / math.sqrt(self.head_dim)
             if x.device.type == "mps":
                 device_type = x.device.type
@@ -633,13 +692,19 @@ class HopeAttention(nn.Module):
                     attn = torch.matmul(qf, kf.transpose(-2, -1)) * float(scale)
 
                     if kv_cache is None:
-                        mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                        if packed_cu_seqlens is not None:
+                            mask = _build_batch_packed_mask(packed_cu_seqlens, packed_num_segs, S, x.device)
+                        else:
+                            mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
                     else:
                         mask = _causal_mask_with_cache(
                             S_q=S, S_k=kv_seq_len, device=x.device, position_offset=position_offset
                         )
 
-                    attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                    if mask.dim() == 2:
+                        attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                    else:
+                        attn = attn.masked_fill(mask.unsqueeze(1), float("-inf"))
                     attn = F.softmax(attn, dim=-1)
                     attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
                     attn_out = torch.matmul(attn, vf)
@@ -649,13 +714,19 @@ class HopeAttention(nn.Module):
                 attn = torch.matmul(q, k_exp.transpose(-2, -1)) * scale
 
                 if kv_cache is None:
-                    mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                    if packed_cu_seqlens is not None:
+                        mask = _build_batch_packed_mask(packed_cu_seqlens, packed_num_segs, S, x.device)
+                    else:
+                        mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
                 else:
                     mask = _causal_mask_with_cache(
                         S_q=S, S_k=kv_seq_len, device=x.device, position_offset=position_offset
                     )
 
-                attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                if mask.dim() == 2:
+                    attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                else:
+                    attn = attn.masked_fill(mask.unsqueeze(1), float("-inf"))
                 attn = F.softmax(attn, dim=-1)
                 attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
                 attn_out = torch.matmul(attn, v_exp)
@@ -689,6 +760,8 @@ class StandardAttention(nn.Module):
         inference_mode: bool = False,
         cu_seqlens: Optional[Tensor] = None, # [FIX] Added missing args to signature
         max_seqlen: Optional[int] = None,    # [FIX] Added missing args to signature
+        packed_cu_seqlens: Optional[Tensor] = None,
+        packed_num_segs: Optional[Tensor] = None,
         kv_cache: Optional[Dict[str, Tensor]] = None,
         position_offset: int = 0,
     ) -> Tuple[Tensor, Dict[str, Tensor], Optional[Dict[str, Tensor]]]:
@@ -726,9 +799,15 @@ class StandardAttention(nn.Module):
             v = v.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_heads, kv_seq_len, self.head_dim)
 
         if self.config.use_flash_attention and FLASH_ATTN_AVAILABLE and kv_cache is None:
-            attn_out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True)
-            attn_out = attn_out.reshape(B, S, -1)
+            if packed_cu_seqlens is None:
+                attn_out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True)
+                attn_out = attn_out.reshape(B, S, -1)
+            else:
+                attn_out = None
         else:
+            attn_out = None
+
+        if attn_out is None:
             scale = 1.0 / math.sqrt(self.head_dim)
             if x.device.type == "mps":
                 device_type = x.device.type
@@ -739,13 +818,19 @@ class StandardAttention(nn.Module):
                     attn = torch.matmul(qf, kf.transpose(-2, -1)) * float(scale)
 
                     if kv_cache is None:
-                        mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                        if packed_cu_seqlens is not None:
+                            mask = _build_batch_packed_mask(packed_cu_seqlens, packed_num_segs, S, x.device)
+                        else:
+                            mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
                     else:
                         mask = _causal_mask_with_cache(
                             S_q=S, S_k=kv_seq_len, device=x.device, position_offset=position_offset
                         )
 
-                    attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                    if mask.dim() == 2:
+                        attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                    else:
+                        attn = attn.masked_fill(mask.unsqueeze(1), float("-inf"))
                     attn = F.softmax(attn, dim=-1)
                     attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
                     attn_out = torch.matmul(attn, vf)
@@ -755,13 +840,19 @@ class StandardAttention(nn.Module):
                 attn = torch.matmul(q, k.transpose(-2, -1)) * scale
 
                 if kv_cache is None:
-                    mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+                    if packed_cu_seqlens is not None:
+                        mask = _build_batch_packed_mask(packed_cu_seqlens, packed_num_segs, S, x.device)
+                    else:
+                        mask = torch.triu(torch.ones(S, kv_seq_len, device=x.device, dtype=torch.bool), diagonal=1)
                 else:
                     mask = _causal_mask_with_cache(
                         S_q=S, S_k=kv_seq_len, device=x.device, position_offset=position_offset
                     )
 
-                attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                if mask.dim() == 2:
+                    attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                else:
+                    attn = attn.masked_fill(mask.unsqueeze(1), float("-inf"))
                 attn = F.softmax(attn, dim=-1)
                 attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
                 attn_out = torch.matmul(attn, v)
@@ -804,6 +895,8 @@ class HopeBlock(nn.Module):
         inference_mode: bool = False,
         cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
+        packed_cu_seqlens: Optional[Tensor] = None,
+        packed_num_segs: Optional[Tensor] = None,
         kv_cache: Optional[Dict[str, Any]] = None,
         position_offset: int = 0,
     ) -> Tuple[Tensor, Dict[str, Any], Optional[Dict[str, Any]]]:
@@ -817,6 +910,8 @@ class HopeBlock(nn.Module):
             inference_mode=inference_mode,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            packed_cu_seqlens=packed_cu_seqlens,
+            packed_num_segs=packed_num_segs,
             kv_cache=layer_kv_cache,
             position_offset=position_offset,
         )
@@ -927,6 +1022,8 @@ class Onyx(nn.Module):
         return_memory_reg_loss: bool = False,
         cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
+        packed_cu_seqlens: Optional[Tensor] = None,
+        packed_num_segs: Optional[Tensor] = None,
         kv_cache: Optional[List[Optional[Dict[str, Any]]]] = None,
         position_offset: int = 0,
     ) -> Dict[str, Any]:
@@ -949,13 +1046,13 @@ class Onyx(nn.Module):
             if self.gradient_checkpointing and self.training:
                 x, new_mem, new_kv = torch.utils.checkpoint.checkpoint(
                     layer, x, memory_states[i], update_memories, inference_mode,
-                    cu_seqlens, max_seqlen, kv_cache[i], position_offset,
+                    cu_seqlens, max_seqlen, packed_cu_seqlens, packed_num_segs, kv_cache[i], position_offset,
                     use_reentrant=False,
                 )
             else:
                 x, new_mem, new_kv = layer(
                     x, memory_states[i], update_memories, inference_mode,
-                    cu_seqlens, max_seqlen, kv_cache[i], position_offset,
+                    cu_seqlens, max_seqlen, packed_cu_seqlens, packed_num_segs, kv_cache[i], position_offset,
                 )
             new_memory_states.append(new_mem)
             new_kv_cache.append(new_kv)

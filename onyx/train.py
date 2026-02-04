@@ -162,8 +162,8 @@ class CMSFrequencyManager:
         if config is None:
             return
 
-        base = int(getattr(config, "cms_base_chunk", 1) or 1)
-        mult = int(getattr(config, "cms_chunk_multiplier", 2) or 2)
+        base = int(getattr(config, "cms_update_every_base_steps", 1) or 1)
+        mult = int(getattr(config, "cms_update_every_multiplier", 2) or 2)
         if base < 1:
             base = 1
         if mult < 1:
@@ -228,6 +228,9 @@ class TrainingConfig:
 
     # === Memory ===
     memory_reg_weight: float = 0.0001
+    persist_memory_across_steps: bool = True
+    reset_memory_every_steps: int = 0
+    reset_memory_on_epoch: bool = True
 
     # === Loss & Regularization ===
     label_smoothing: float = 0.0
@@ -908,8 +911,16 @@ def collate_onyx(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     out["labels"] = torch.stack([b["labels"] for b in batch], dim=0)
 
     if "cu_seqlens" in batch[0]:
-        out["cu_seqlens"] = [b["cu_seqlens"] for b in batch]  # ragged list
-        out["max_seqlen"] = torch.tensor([b.get("max_seqlen", 0) for b in batch], dtype=torch.int32)
+        bnds = [b["cu_seqlens"] for b in batch]
+        max_len = max(x.numel() for x in bnds)
+        cu = torch.full((len(batch), max_len), -1, dtype=torch.int32)
+        ns = torch.zeros((len(batch),), dtype=torch.int32)
+        for i, x in enumerate(bnds):
+            cu[i, : x.numel()] = x
+            ns[i] = x.numel()
+        out["cu_seqlens"] = cu
+        out["num_segs"] = ns
+        out["max_seqlen"] = torch.tensor(batch[0].get("max_seqlen", 0), dtype=torch.int32)
     return out
 
 
@@ -1491,7 +1502,7 @@ class Trainer:
             pack=cfg.pack_sequences,
             seed=cfg.seed,
             drop_remainder=cfg.drop_remainder,
-            emit_cu_seqlens=(self.device_type == "cuda"),
+            emit_cu_seqlens=True,
             shuffle_buffer_docs=cfg.shuffle_buffer_docs,
         )
 
@@ -1622,9 +1633,10 @@ class Trainer:
         out: Dict[str, Any] = {}
         out["input_ids"] = batch["input_ids"].to(self.device)
         out["labels"] = batch["labels"].to(self.device)
-        if self.device_type == "cuda" and "cu_seqlens" in batch:
-            out["cu_seqlens"] = batch["cu_seqlens"]  # list[Tensor] on CPU ok
-            out["max_seqlen"] = batch["max_seqlen"]  # Tensor on CPU
+        if "cu_seqlens" in batch:
+            out["cu_seqlens"] = batch["cu_seqlens"].to(self.device)
+            out["num_segs"] = batch["num_segs"].to(self.device)
+            out["max_seqlen"] = batch["max_seqlen"]
         return out
 
     def train_step(self, memory_states=None):
@@ -1660,18 +1672,24 @@ class Trainer:
 
             cu_seqlens = None
             max_seqlen = None
-            if self.device_type == "cuda" and "cu_seqlens" in batch:
+            packed_cu_seqlens = None
+            packed_num_segs = None
+            if "cu_seqlens" in batch:
+                packed_cu_seqlens = batch["cu_seqlens"]
+                packed_num_segs = batch.get("num_segs")
+            if self.device_type == "cuda" and packed_cu_seqlens is not None:
                 # Build combined cu_seqlens across batch (flattened)
                 B, S = input_ids.shape
                 combined = [0]
                 offset = 0
                 for b in range(B):
-                    sample_cu = batch["cu_seqlens"][b]
-                    for i in range(1, len(sample_cu)):
+                    n = int(packed_num_segs[b].item()) if packed_num_segs is not None else packed_cu_seqlens.size(1)
+                    sample_cu = packed_cu_seqlens[b, :n]
+                    for i in range(1, sample_cu.numel()):
                         combined.append(offset + int(sample_cu[i].item()))
                     offset += S
                 cu_seqlens = torch.tensor(combined, dtype=torch.int32, device=self.device)
-                max_seqlen = int(batch["max_seqlen"].max().item()) if torch.is_tensor(batch["max_seqlen"]) else S
+                max_seqlen = int(batch["max_seqlen"].item()) if torch.is_tensor(batch["max_seqlen"]) else S
 
             memory_states = self.model.detach_memory_states(memory_states)
 
@@ -1693,6 +1711,8 @@ class Trainer:
                         return_memory_reg_loss=True,
                         cu_seqlens=cu_seqlens,
                         max_seqlen=max_seqlen,
+                        packed_cu_seqlens=packed_cu_seqlens,
+                        packed_num_segs=packed_num_segs,
                     )
             elif self.use_autocast and self.device_type == "mps":
                 with torch.autocast(device_type="mps", dtype=self.autocast_dtype):
@@ -1704,6 +1724,8 @@ class Trainer:
                         return_memory_reg_loss=True,
                         cu_seqlens=cu_seqlens,
                         max_seqlen=max_seqlen,
+                        packed_cu_seqlens=packed_cu_seqlens,
+                        packed_num_segs=packed_num_segs,
                     )
             else:
                 out = self.model(
@@ -1714,6 +1736,8 @@ class Trainer:
                     return_memory_reg_loss=True,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
+                    packed_cu_seqlens=packed_cu_seqlens,
+                    packed_num_segs=packed_num_segs,
                 )
 
             last_logits = out.get("logits")
@@ -1987,11 +2011,24 @@ class Trainer:
                 f"dataset_state_loaded={self._resume_dataset_state_loaded}"
             )
 
-        # Reset memory every optimizer step (do NOT carry across steps)
+        steps_per_epoch = None
+        if cfg.num_epochs and total_steps and cfg.num_epochs > 0:
+            steps_per_epoch = max(1, int(total_steps // max(1, cfg.num_epochs)))
+
         start_time = time.time()
         log_loss = 0.0
         log_tokens = 0
         log_steps = 0
+        memory_states = None
+        if cfg.persist_memory_across_steps:
+            if self.last_memory_states is not None:
+                memory_states = self.last_memory_states
+            else:
+                memory_states = self.model.init_memory_states(
+                    cfg.batch_size,
+                    self.device,
+                    self.autocast_dtype if self.use_autocast else torch.float32,
+                )
 
         while self.global_step < total_steps:
             if self._interrupt_requested:
@@ -2000,11 +2037,20 @@ class Trainer:
                 self._log("Checkpoint saved. Exiting.", force=True)
                 return
 
+            if steps_per_epoch and self.global_step > 0 and self.global_step % steps_per_epoch == 0:
+                self.current_epoch += 1
+                if cfg.reset_memory_on_epoch:
+                    memory_states = None
+
+            if cfg.reset_memory_every_steps > 0 and self.global_step > 0 and self.global_step % cfg.reset_memory_every_steps == 0:
+                memory_states = None
+
             lr = get_lr(self.global_step, cfg, total_steps)
             set_lr(self.optimizer, lr)
 
-            # KEY CHANGE: always reset memory per optimizer step
-            metrics, _ = self.train_step(memory_states=None)
+            metrics, memory_states = self.train_step(
+                memory_states=memory_states if cfg.persist_memory_across_steps else None
+            )
             if metrics is None:
                 continue
 
@@ -2259,6 +2305,9 @@ def _build_config_from_args(args: argparse.Namespace) -> TrainingConfig:
         mhc_mode=args.mhc_mode,
         mhc_debug_finite_checks=args.mhc_debug_finite_checks,
         mhc_debug_every=args.mhc_debug_every,
+        persist_memory_across_steps=args.persist_memory_across_steps,
+        reset_memory_every_steps=args.reset_memory_every_steps,
+        reset_memory_on_epoch=args.reset_memory_on_epoch,
         bench_steps=args.bench_steps,
         disable_saves_during_bench=args.disable_saves_during_bench,
         save_dir=args.save_dir,
@@ -2410,6 +2459,9 @@ def main():
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--amp_dtype", type=str, choices=["float16", "bfloat16"], default="float16")
     p.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--persist_memory_across_steps", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--reset_memory_every_steps", type=int, default=0)
+    p.add_argument("--reset_memory_on_epoch", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--experimental_mhc", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--mhc_n", type=int, default=2)
