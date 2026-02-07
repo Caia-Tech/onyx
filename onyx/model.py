@@ -1279,6 +1279,7 @@ def create_onyx(**kwargs) -> Onyx:
 def get_param_groups(model: Onyx, weight_decay: float = 0.1, memory_lr_scale: float = 0.1):
     decay_params, no_decay_params, memory_params = [], [], []
     embed_params = []
+    mixer_params = []
     seen = set()
 
     def add_unique(lst, p):
@@ -1294,6 +1295,10 @@ def get_param_groups(model: Onyx, weight_decay: float = 0.1, memory_lr_scale: fl
 
         if "embed" in name or "lm_head" in name:
             add_unique(embed_params, param)
+            continue
+
+        if "mixers." in name:
+            add_unique(mixer_params, param)
             continue
 
         if any(k in name for k in ("eta_proj", "alpha_proj", "gate_proj")):
@@ -1313,4 +1318,6 @@ def get_param_groups(model: Onyx, weight_decay: float = 0.1, memory_lr_scale: fl
     ]
     if embed_params:
         groups.append({"params": embed_params, "weight_decay": 0.0, "m3_mode": "vector"})
+    if mixer_params:
+        groups.append({"params": mixer_params, "weight_decay": 0.0, "m3_mode": "vector"})
     return groups

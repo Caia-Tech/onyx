@@ -25,6 +25,7 @@ MEM_REPORT_EVERY="${MEM_REPORT_EVERY:-100}"
 PEAK_LR="${PEAK_LR:-1e-4}"
 MIN_LR="${MIN_LR:-2e-5}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.002}"
+LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.05}"
 LOCK_DIR="${CKPT_DIR}/.train_autoresume.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 
@@ -82,6 +83,7 @@ BASE_CMD=(
   --learning_rate "$PEAK_LR"
   --min_lr "$MIN_LR"
   --warmup_ratio "$WARMUP_RATIO"
+  --label_smoothing "$LABEL_SMOOTHING"
   --no-amp
   --save_dir "$CKPT_DIR"
   --save_every_steps 500

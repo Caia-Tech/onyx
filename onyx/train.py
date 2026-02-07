@@ -2335,6 +2335,10 @@ def _build_config_from_args(args: argparse.Namespace) -> TrainingConfig:
         warmup_steps=args.warmup_steps,
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
+        gradient_clip=args.gradient_clip,
+        label_smoothing=args.label_smoothing,
+        entropy_reg_weight=args.entropy_reg_weight,
+        feedback_strength=args.feedback_strength,
         use_m3_optimizer=(not args.use_adamw),
         use_torch_compile=args.compile,
         compile_mode=args.compile_mode,
@@ -2494,6 +2498,10 @@ def main():
     p.add_argument("--warmup_steps", type=int, default=50)
     p.add_argument("--warmup_ratio", type=float, default=None, help="Override warmup_steps as ratio of total_steps.")
     p.add_argument("--weight_decay", type=float, default=0.1)
+    p.add_argument("--gradient_clip", type=float, default=1.0)
+    p.add_argument("--label_smoothing", type=float, default=0.0)
+    p.add_argument("--entropy_reg_weight", type=float, default=0.0)
+    p.add_argument("--feedback_strength", type=float, default=1.0)
 
     p.add_argument("--use_adamw", action="store_true")
 

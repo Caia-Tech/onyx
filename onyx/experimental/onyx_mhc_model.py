@@ -367,14 +367,32 @@ class OnyxMHC(nn.Module):
                     if self._should_check(step):
                         if not torch.isfinite(shift_logits).all().item():
                             raise RuntimeError("Non-finite logits before cross_entropy")
-                    per_tok = F.cross_entropy(
-                        flat_logits,
-                        flat_labels,
-                        ignore_index=-100,
-                        reduction="none",
-                    )
+
+                    if self.config.label_smoothing > 0.0:
+                        smoothing = float(self.config.label_smoothing)
+                        log_probs = F.log_softmax(flat_logits, dim=-1)
+                        # Clamp ignored labels to a valid index for gather; they are masked out later.
+                        safe_labels = flat_labels.clamp(min=0)
+                        nll = -log_probs.gather(dim=-1, index=safe_labels.unsqueeze(1)).squeeze(1)
+                        smooth_loss = -log_probs.mean(dim=-1)
+                        per_tok = (1.0 - smoothing) * nll + smoothing * smooth_loss
+                    else:
+                        per_tok = F.cross_entropy(
+                            flat_logits,
+                            flat_labels,
+                            ignore_index=-100,
+                            reduction="none",
+                        )
                     denom = valid.sum().clamp(min=1)
                     loss = per_tok[valid].sum() / denom
+
+                    if self.config.entropy_reg_weight > 0.0:
+                        weight = float(self.config.entropy_reg_weight)
+                        valid_logits = flat_logits[valid]
+                        probs = F.softmax(valid_logits, dim=-1)
+                        log_probs = F.log_softmax(valid_logits, dim=-1)
+                        entropy = -(probs * log_probs).sum(dim=-1).mean()
+                        loss = loss - weight * entropy
                 else:
                     loss = torch.zeros((), device=logits.device, dtype=torch.float32)
 
