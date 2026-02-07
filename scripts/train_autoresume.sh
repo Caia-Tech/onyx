@@ -24,7 +24,7 @@ ALERT_EFFECTIVE_VOCAB="${ALERT_EFFECTIVE_VOCAB:-100}"
 MEM_REPORT_EVERY="${MEM_REPORT_EVERY:-100}"
 PEAK_LR="${PEAK_LR:-1e-4}"
 MIN_LR="${MIN_LR:-2e-5}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.01}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.002}"
 LOCK_DIR="${CKPT_DIR}/.train_autoresume.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 
@@ -74,7 +74,7 @@ BASE_CMD=(
   --data_glob "$DATA_GLOB"
   --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizers/onyx_tokenizer_32k"
   --model_config "$MODEL_CONFIG"
-  --batch_size 2
+  --batch_size 4
   --max_seq_len 2048
   --tokens_per_step 16384
   --shuffle_buffer_docs "$SHUFFLE_BUFFER_DOCS"
@@ -82,8 +82,7 @@ BASE_CMD=(
   --learning_rate "$PEAK_LR"
   --min_lr "$MIN_LR"
   --warmup_ratio "$WARMUP_RATIO"
-  --amp
-  --amp_dtype "$AMP_DTYPE"
+  --no-amp
   --save_dir "$CKPT_DIR"
   --save_every_steps 500
   --train_tokens_target 7536720684

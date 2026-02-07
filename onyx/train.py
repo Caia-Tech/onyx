@@ -1043,6 +1043,8 @@ class Trainer:
         self._resume_dataset_state_loaded = False
         self._resume_memory_states_loaded = False
         self._logger_configured = False
+        self._checked_token_range = False
+        self.skipped_steps = 0
 
         # Initialize monitors to None (will be set in setup() if enabled)
         self.diversity_monitor: Optional[Any] = None
@@ -1056,6 +1058,15 @@ class Trainer:
     def _handle_signal(self, signum, frame):
         self._log(f"\n[SIGNAL] Received {signum}, will save and exit after current step...", force=True)
         self._interrupt_requested = True
+
+    def _has_nonfinite_grads(self) -> bool:
+        for name, param in self.model.named_parameters():
+            if param.grad is None:
+                continue
+            if not torch.isfinite(param.grad).all():
+                self._log(f"[WARN] Non-finite grad in {name}; skipping optimizer step.", force=True)
+                return True
+        return False
 
     def _nan_tripwire(
         self,
@@ -1669,6 +1680,13 @@ class Trainer:
             input_ids = batch["input_ids"]
             labels = batch["labels"]
             total_tokens += input_ids.numel()
+            if not self._checked_token_range:
+                min_id = int(input_ids.min().item())
+                max_id = int(input_ids.max().item())
+                vocab_size = int(getattr(self.model.config, "vocab_size", 0) or 0)
+                if vocab_size > 0 and (min_id < 0 or max_id >= vocab_size):
+                    raise RuntimeError(f"Token IDs out of range: min={min_id} max={max_id} vocab={vocab_size}")
+                self._checked_token_range = True
 
             cu_seqlens = None
             max_seqlen = None
@@ -1829,6 +1847,18 @@ class Trainer:
         if self._cms_manager is not None:
             self._cms_manager.mask_gradients(self.global_step)
 
+        if self._has_nonfinite_grads():
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.scaler is not None:
+                self.scaler.update()
+            self.skipped_steps += 1
+            return {
+                "loss": total_loss / max(1, self.accumulation_steps),
+                "grad_norm": float("nan"),
+                "tokens": total_tokens,
+                "skipped": 1,
+            }, memory_states
+
         if cfg.gradient_clip > 0:
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
@@ -1868,6 +1898,7 @@ class Trainer:
             "loss": total_loss / max(1, self.accumulation_steps),
             "grad_norm": grad_norm_val,
             "tokens": total_tokens,
+            "skipped": 0,
         }, memory_states
 
     def _maybe_report_memory(self) -> None:
@@ -2062,20 +2093,33 @@ class Trainer:
                 elapsed = time.time() - start_time
                 avg_loss = log_loss / max(1, log_steps)
                 tokps = log_tokens / max(1e-8, elapsed)
+                scale = None
+                if self.scaler is not None:
+                    try:
+                        scale = float(self.scaler.get_scale())
+                    except Exception:
+                        scale = None
 
-                self._log(
-                    f"Step {self.global_step:6d} | Loss {avg_loss:.4f} | LR {lr:.2e} | Tok/s {tokps:.0f}",
-                )
+                msg = f"Step {self.global_step:6d} | Loss {avg_loss:.4f} | LR {lr:.2e} | Tok/s {tokps:.0f}"
+                if scale is not None:
+                    msg += f" | Scale {scale:.1f}"
+                if self.skipped_steps:
+                    msg += f" | Skipped {self.skipped_steps}"
+                self._log(msg)
 
                 if cfg.wandb_project and WANDB_AVAILABLE:
-                    wandb.log({
+                    payload = {
                         "train/loss": avg_loss,
                         "train/lr": lr,
                         "train/grad_norm": metrics["grad_norm"],
                         "train/tokps": tokps,
                         "train/tokens_seen": self.tokens_seen,
                         "train/step": self.global_step,
-                    })
+                        "train/skip_steps": self.skipped_steps,
+                    }
+                    if scale is not None:
+                        payload["train/grad_scale"] = scale
+                    wandb.log(payload)
 
                 log_loss = 0.0
                 log_tokens = 0

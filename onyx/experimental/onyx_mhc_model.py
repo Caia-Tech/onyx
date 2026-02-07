@@ -354,27 +354,29 @@ class OnyxMHC(nn.Module):
 
         loss = None
         if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            flat_logits = shift_logits.view(-1, self.config.vocab_size)
-            flat_labels = shift_labels.view(-1)
-            valid = flat_labels != -100
-            if valid.any():
-                # Debug-only: avoid advanced indexing `flat_logits[valid]` which can allocate
-                # a huge temporary (N_valid x vocab) and OOM even on large GPUs.
-                if self._should_check(step):
-                    if not torch.isfinite(shift_logits).all().item():
-                        raise RuntimeError("Non-finite logits before cross_entropy")
-                per_tok = F.cross_entropy(
-                    flat_logits,
-                    flat_labels,
-                    ignore_index=-100,
-                    reduction="none",
-                )
-                denom = valid.sum().clamp(min=1)
-                loss = per_tok[valid].sum() / denom
-            else:
-                loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
+            device_type = logits.device.type
+            with torch.autocast(device_type=device_type, enabled=False):
+                shift_logits = logits[:, :-1, :].contiguous().float()
+                shift_labels = labels[:, 1:].contiguous()
+                flat_logits = shift_logits.view(-1, self.config.vocab_size)
+                flat_labels = shift_labels.view(-1)
+                valid = flat_labels != -100
+                if valid.any():
+                    # Debug-only: avoid advanced indexing `flat_logits[valid]` which can allocate
+                    # a huge temporary (N_valid x vocab) and OOM even on large GPUs.
+                    if self._should_check(step):
+                        if not torch.isfinite(shift_logits).all().item():
+                            raise RuntimeError("Non-finite logits before cross_entropy")
+                    per_tok = F.cross_entropy(
+                        flat_logits,
+                        flat_labels,
+                        ignore_index=-100,
+                        reduction="none",
+                    )
+                    denom = valid.sum().clamp(min=1)
+                    loss = per_tok[valid].sum() / denom
+                else:
+                    loss = torch.zeros((), device=logits.device, dtype=torch.float32)
 
         out = {
             "logits": logits,

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Optional, Dict, Any
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,28 @@ except Exception:  # pragma: no cover
             return False
 
 
+def _maybe_sanitize(name: str, tensor: Tensor) -> Tensor:
+    if os.getenv("ONYX_MHC_DEBUG_NONFINITE") != "1":
+        return tensor
+    if torch.isfinite(tensor).all():
+        return tensor
+    data = tensor.detach().float()
+    nan = int(torch.isnan(data).sum().item())
+    inf = int(torch.isinf(data).sum().item())
+    finite = torch.isfinite(data)
+    if finite.any():
+        f = data[finite]
+        mean = float(f.mean().item())
+        vmax = float(f.max().item())
+        vmin = float(f.min().item())
+    else:
+        mean = float("nan")
+        vmax = float("nan")
+        vmin = float("nan")
+    print(f"[MHC][NonFinite] {name} nan={nan} inf={inf} mean={mean:.4e} max={vmax:.4e} min={vmin:.4e}")
+    return torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+
+
 def sinkhorn_project(matrix: Tensor, iters: int = 10, eps: float = 1e-8) -> Tensor:
     """
     Approximate doubly-stochastic projection via Sinkhorn normalization.
@@ -32,13 +55,17 @@ def sinkhorn_project(matrix: Tensor, iters: int = 10, eps: float = 1e-8) -> Tens
 
     steps = max(0, int(iters))
     eps = float(eps)
-    p = matrix.float()
-    p = p.clamp_min(eps)
-
-    for _ in range(steps):
-        p = p / (p.sum(dim=-1, keepdim=True) + eps)
-        p = p / (p.sum(dim=-2, keepdim=True) + eps)
+    device_type = matrix.device.type
+    with torch.autocast(device_type=device_type, enabled=False):
+        p = matrix.float()
         p = p.clamp_min(eps)
+        p = _maybe_sanitize("sinkhorn_init", p)
+
+        for i in range(steps):
+            p = p / (p.sum(dim=-1, keepdim=True) + eps)
+            p = p / (p.sum(dim=-2, keepdim=True) + eps)
+            p = p.clamp_min(eps)
+            p = _maybe_sanitize(f"sinkhorn_iter_{i}", p)
 
     return p
 
@@ -91,13 +118,17 @@ class MHCMixer(nn.Module):
 
     def _mix_matrix(self) -> Tensor:
         eps = self.eps
-        logits = self.matrix.float()
-        p = torch.softmax(logits, dim=-1)
-        p = p.clamp_min(eps)
-        p = p / (p.sum(dim=-1, keepdim=True) + eps)
-        if self.mode == "hc" or not self.use_sinkhorn:
-            return p
-        return sinkhorn_project(p, iters=self.sinkhorn_iters, eps=eps)
+        device_type = self.matrix.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            logits = self.matrix.float()
+            logits = logits - logits.max(dim=-1, keepdim=True).values
+            logits = logits.clamp(min=-50.0, max=50.0)
+            p = torch.softmax(logits, dim=-1)
+            p = p.clamp_min(eps)
+            p = p / (p.sum(dim=-1, keepdim=True) + eps)
+            if self.mode == "hc" or not self.use_sinkhorn:
+                return _maybe_sanitize("mhc_mix", p)
+            return sinkhorn_project(p, iters=self.sinkhorn_iters, eps=eps)
 
     def forward(self, x_streams: Tensor) -> Tensor:
         mix = self._mix_matrix()
@@ -128,6 +159,8 @@ class MHCMixer(nn.Module):
                     "max": vmax,
                     "min": vmin,
                 }
-        x = x_streams.float()
-        mixed = torch.einsum("b s n d, n m -> b s m d", x, mix)
+        device_type = x_streams.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            x = x_streams.float()
+            mixed = torch.einsum("b s n d, n m -> b s m d", x, mix.float())
         return mixed.to(dtype=x_streams.dtype)
