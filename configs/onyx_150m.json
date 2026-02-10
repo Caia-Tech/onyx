@@ -4,7 +4,7 @@
     "n_layers": 8,
     "n_heads": 16,
     "n_kv_heads": 4,
-    "d_ff": 3840,
+    "d_ff": 3456,
     "vocab_size": 33760,
     "max_seq_len": 4096,
     "rope_base": 500000.0,

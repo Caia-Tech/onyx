@@ -127,9 +127,11 @@ class DiversityMonitor:
         metrics["entropy_ratio"] = float(entropy / max_entropy)
         metrics["max_entropy"] = float(max_entropy)
 
-        # 3. Effective vocabulary (how many tokens have non-negligible probability?)
-        # Threshold: 0.001 = 0.1% probability
-        metrics["effective_vocab"] = int((avg_probs > 0.001).sum().item())
+        # 3. Effective vocabulary (entropy-equivalent support size).
+        # N_eff = exp(H), where H = -sum p log p.
+        # This is scale-aware for large vocabularies (unlike fixed p-threshold counts).
+        eff_vocab = int(round(math.exp(float(entropy))))
+        metrics["effective_vocab"] = int(max(1, min(self.vocab_size, eff_vocab)))
 
         # 4. Top token IDs and strings (for inspection)
         top10_ids = topk_indices[:10].cpu().tolist()

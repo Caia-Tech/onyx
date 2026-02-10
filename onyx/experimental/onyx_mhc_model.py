@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from onyx.model import OnyxConfig, HopeBlock, RMSNorm
+from onyx.model import OnyxConfig, HopeBlock, RMSNorm, RMTBlock
 from onyx.experimental.mhc import MHCMixer, aggregate_streams, scatter_delta
 
 
@@ -36,6 +36,10 @@ class OnyxMHC(nn.Module):
             raise ValueError(f"mhc_mode must be 'mhc' or 'hc', got {mhc_mode}")
 
         self.config = config
+        self.use_rmt = bool(config.use_rmt)
+        self.rmt_heads = int(config.rmt_heads or config.n_heads)
+        self.rmt_dk = int(config.rmt_dk)
+        self.rmt_dv = int(config.rmt_dv)
         self.mhc_n = int(mhc_n)
         self.mhc_mode = mhc_mode
         self.mhc_sinkhorn = bool(mhc_sinkhorn)
@@ -44,7 +48,20 @@ class OnyxMHC(nn.Module):
         self.embed = nn.Embedding(config.vocab_size, config.d_model)
         self.embed_dropout = nn.Dropout(config.dropout)
 
-        self.layers = nn.ModuleList([HopeBlock(config, layer_idx=i) for i in range(config.n_layers)])
+        if self.use_rmt:
+            if self.rmt_heads != int(config.n_heads):
+                raise ValueError("RMT currently requires rmt_heads == n_heads.")
+            if self.rmt_dk < 1 or self.rmt_dv < 1:
+                raise ValueError("RMT requires rmt_dk >= 1 and rmt_dv >= 1.")
+            if self.rmt_dv % 2 != 0:
+                raise ValueError("RMT requires rmt_dv to be even for rotary embedding.")
+            self.rmt_in_proj = nn.Linear(config.d_model, self.rmt_dk * self.rmt_dv, bias=False)
+            self.rmt_readout = nn.Parameter(torch.empty(self.rmt_heads, self.rmt_dk))
+            nn.init.normal_(self.rmt_readout, mean=0.0, std=0.02)
+            self.rmt_out_proj = nn.Linear(self.rmt_heads * self.rmt_dv, config.d_model, bias=False)
+            self.layers = nn.ModuleList([RMTBlock(config, layer_idx=i) for i in range(config.n_layers)])
+        else:
+            self.layers = nn.ModuleList([HopeBlock(config, layer_idx=i) for i in range(config.n_layers)])
         self.mixers = nn.ModuleList(
             [
                 MHCMixer(
@@ -163,7 +180,7 @@ class OnyxMHC(nn.Module):
 
     def _block_forward(
         self,
-        layer: HopeBlock,
+        layer: nn.Module,
         x: Tensor,
         memory_states: Optional[Dict[str, Any]],
         update_memories: bool,
@@ -178,6 +195,22 @@ class OnyxMHC(nn.Module):
         layer_idx: int,
         step: Optional[int],
     ) -> Tuple[Tensor, Dict[str, Any], Optional[Dict[str, Any]]]:
+        if self.use_rmt:
+            out_x, new_states, new_kv = layer(
+                x,
+                memory_states=memory_states,
+                update_memories=update_memories,
+                inference_mode=inference_mode,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                packed_cu_seqlens=packed_cu_seqlens,
+                packed_num_segs=packed_num_segs,
+                kv_cache=kv_cache,
+                position_offset=position_offset,
+            )
+            self._check_finite("rmt_out", out_x, step=step, layer=layer_idx)
+            return out_x, new_states, new_kv
+
         attn_mem = memory_states.get("attention", {}) if memory_states else {}
         layer_kv_cache = kv_cache.get("kv", None) if kv_cache else None
 
@@ -267,7 +300,11 @@ class OnyxMHC(nn.Module):
         x = self.embed(input_ids)
         x = self.embed_dropout(x)
         scale = 1.0 / math.sqrt(self.mhc_n)
-        x_streams = x.unsqueeze(2).expand(-1, -1, self.mhc_n, -1) * scale
+        if self.use_rmt:
+            X = self.rmt_in_proj(x).view(B, S, self.rmt_dk, self.rmt_dv)
+            x_streams = X.unsqueeze(2).expand(-1, -1, self.mhc_n, -1, -1) * scale
+        else:
+            x_streams = x.unsqueeze(2).expand(-1, -1, self.mhc_n, -1) * scale
         step = getattr(self, "global_step", None)
         self._check_finite("stream_split", x_streams, step=step)
 
@@ -333,8 +370,16 @@ class OnyxMHC(nn.Module):
                 )
 
             delta = x_out - x
-            x_streams = scatter_delta(x_streams, delta, stream_idx=0)
-            x_streams = self.mixers[i](x_streams)
+            if self.use_rmt:
+                out = x_streams.clone()
+                out[:, :, 0, :, :] = out[:, :, 0, :, :] + delta
+                x_streams = out
+                mix = self.mixers[i]._mix_matrix()
+                with torch.autocast(device_type=x_streams.device.type, enabled=False):
+                    x_streams = torch.einsum("b s n k v, n m -> b s m k v", x_streams.float(), mix.float()).to(dtype=x_streams.dtype)
+            else:
+                x_streams = scatter_delta(x_streams, delta, stream_idx=0)
+                x_streams = self.mixers[i](x_streams)
             self._check_finite("post_mix", x_streams, step=step, layer=i)
 
             new_memory_states.append(new_mem)
@@ -346,6 +391,9 @@ class OnyxMHC(nn.Module):
             self._memory_update_count += S
 
         x = aggregate_streams(x_streams)
+        if self.use_rmt:
+            view = torch.einsum("rk,btkv->btrv", self.rmt_readout.to(dtype=x.dtype), x)
+            x = self.rmt_out_proj(view.reshape(B, S, -1))
         self._check_finite("final_aggregate", x, step=step)
         x = self.norm(x)
         self._check_finite("final_norm", x, step=step)

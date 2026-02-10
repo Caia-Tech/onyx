@@ -117,6 +117,7 @@ def sample_token(
     top_p: float = 0.9,
     min_p: float = 0.05,
     repetition_penalty: float = 1.15,
+    generated_tokens: Optional[Any] = None,
     recent_tokens: Optional[List[int]] = None,
     rep_window: int = 128,
     freq_penalty: float = 0.3,
@@ -128,9 +129,19 @@ def sample_token(
     """
     assert logits.dim() == 2 and logits.size(0) == 1
 
-    # Greedy
-    if temperature <= 1e-6:
-        return torch.argmax(logits, dim=-1, keepdim=True)
+    # Back-compat: support generated_tokens alias used by older callsites/tests.
+    if recent_tokens is None and generated_tokens is not None:
+        if isinstance(generated_tokens, torch.Tensor):
+            recent_tokens = generated_tokens.detach().view(-1).tolist()
+        elif isinstance(generated_tokens, set):
+            recent_tokens = list(generated_tokens)
+        elif isinstance(generated_tokens, (list, tuple)):
+            recent_tokens = list(generated_tokens)
+        else:
+            try:
+                recent_tokens = list(generated_tokens)  # type: ignore[arg-type]
+            except Exception:
+                recent_tokens = []
 
     # ---- Hard run-ban (kills "the the the...") ----
     if recent_tokens and ban_run_len > 0:
@@ -168,6 +179,10 @@ def sample_token(
             for tid, c in counts.items():
                 if 0 <= tid < V:
                     logits[0, tid] -= freq_penalty * float(c)
+
+    # Greedy (after penalties)
+    if temperature <= 1e-6:
+        return torch.argmax(logits, dim=-1, keepdim=True)
 
     # temperature scaling
     logits = logits / max(temperature, 1e-8)
@@ -680,18 +695,28 @@ def main():
         return
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-    model, _ = load_model(
-        args.checkpoint,
-        tokenizer,
-        device=device,
-        dtype=dtype,
-        model_config_path=args.model_config,
-        experimental_mhc=args.experimental_mhc,
-        mhc_n=args.mhc_n,
-        mhc_mode=args.mhc_mode,
-        mhc_sinkhorn=args.mhc_sinkhorn,
-        mhc_sinkhorn_iters=args.mhc_sinkhorn_iters,
-    )
+    try:
+        model, _ = load_model(
+            args.checkpoint,
+            tokenizer,
+            device=device,
+            dtype=dtype,
+            model_config_path=args.model_config,
+            experimental_mhc=args.experimental_mhc,
+            mhc_n=args.mhc_n,
+            mhc_mode=args.mhc_mode,
+            mhc_sinkhorn=args.mhc_sinkhorn,
+            mhc_sinkhorn_iters=args.mhc_sinkhorn_iters,
+        )
+    except TypeError:
+        # Back-compat with monkeypatched/older load_model implementations.
+        model, _ = load_model(
+            args.checkpoint,
+            tokenizer,
+            device=device,
+            dtype=dtype,
+            model_config_path=args.model_config,
+        )
 
     if args.prompt:
         onyx_tag = _onyx_blue("onyx")

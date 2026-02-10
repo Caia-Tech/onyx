@@ -108,6 +108,16 @@ class OnyxConfig:
     mhc_debug_finite_checks: bool = False
     mhc_debug_every: int = 0
 
+    # === Residual Matrix Transformer (RMT) ===
+    use_rmt: bool = False
+    rmt_dk: int = 16
+    rmt_dv: int = 16
+    rmt_heads: int = 0  # 0 => default to n_heads
+    rmt_ff_multiplier: float = 2.0
+    rmt_ff_dim: int = 0  # 0 => infer from rmt_heads * rmt_dv * rmt_ff_multiplier
+    rmt_init: str = "normal"  # "normal" | "zero"
+    rmt_readwrite_dtype: str = "float32"
+
 
 # =============================================================================
 # Basic Components
@@ -861,6 +871,324 @@ class StandardAttention(nn.Module):
         return self.o_proj(attn_out), {}, new_kv_cache
 
 
+def _rmt_dtype_from_name(name: str) -> torch.dtype:
+    table = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+    }
+    key = str(name).lower()
+    if key not in table:
+        raise ValueError(f"Unsupported rmt_readwrite_dtype={name}")
+    return table[key]
+
+
+def _rmt_init_param_(p: nn.Parameter, mode: str, std: float = 0.02) -> None:
+    m = str(mode).lower()
+    if m == "zero":
+        nn.init.zeros_(p)
+    elif m == "normal":
+        nn.init.normal_(p, mean=0.0, std=std)
+    else:
+        raise ValueError(f"Unsupported rmt_init={mode}")
+
+
+class RMTAttention(nn.Module):
+    """
+    Residual-matrix attention.
+    X: [B, T, Dk, Dv]
+    """
+
+    def __init__(self, config: OnyxConfig, layer_idx: int = 0):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.n_heads = int(config.rmt_heads or config.n_heads)
+        self.n_kv_heads = int(config.n_kv_heads)
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.dk = int(config.rmt_dk)
+        self.dv = int(config.rmt_dv)
+        self.readwrite_dtype = _rmt_dtype_from_name(config.rmt_readwrite_dtype)
+
+        self.r_q = nn.Parameter(torch.empty(self.n_heads, self.dk))
+        self.r_k = nn.Parameter(torch.empty(self.n_kv_heads, self.dk))
+        self.r_v = nn.Parameter(torch.empty(self.n_kv_heads, self.dk))
+        self.w_o = nn.Parameter(torch.empty(self.n_heads, self.dk))
+        _rmt_init_param_(self.r_q, config.rmt_init)
+        _rmt_init_param_(self.r_k, config.rmt_init)
+        _rmt_init_param_(self.r_v, config.rmt_init)
+        _rmt_init_param_(self.w_o, config.rmt_init)
+
+        self.rotary = RotaryEmbedding(self.dv, config.max_seq_len, config.rope_base)
+
+        kv_flat_dim = self.n_kv_heads * self.dv
+        if config.use_hope_attention and config.self_referential_keys:
+            self.k_memory = ChunkedSelfReferentialMemory(kv_flat_dim, kv_flat_dim, config)
+        else:
+            self.k_memory = None
+        if config.use_hope_attention and config.self_referential_values:
+            self.v_memory = ChunkedSelfReferentialMemory(kv_flat_dim, kv_flat_dim, config)
+        else:
+            self.v_memory = None
+
+    def init_memory_states(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> Dict[str, Tensor]:
+        states: Dict[str, Tensor] = {}
+        if self.k_memory is not None:
+            states["k"] = self.k_memory.init_state(batch_size, device, dtype)
+        if self.v_memory is not None:
+            states["v"] = self.v_memory.init_state(batch_size, device, dtype)
+        return states
+
+    def get_memory_reg_loss(self, memory_states: Dict[str, Tensor]) -> Tensor:
+        loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        if self.k_memory is not None and "k" in memory_states:
+            loss = loss + self.k_memory.get_memory_reg_loss(memory_states["k"])
+        if self.v_memory is not None and "v" in memory_states:
+            loss = loss + self.v_memory.get_memory_reg_loss(memory_states["v"])
+        return loss
+
+    def _read_heads(self, X: Tensor, r: Tensor) -> Tensor:
+        device_type = X.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            xf = X.to(dtype=self.readwrite_dtype)
+            rf = r.to(device=X.device, dtype=self.readwrite_dtype)
+            out = torch.einsum("hk,btkv->bthv", rf, xf)
+        return out.to(dtype=X.dtype)
+
+    def _write_heads(self, X: Tensor, w: Tensor, v: Tensor) -> Tensor:
+        # X += sum_h w[h] outer v[h]
+        device_type = X.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            xf = X.to(dtype=self.readwrite_dtype)
+            wf = w.to(device=X.device, dtype=self.readwrite_dtype)
+            vf = v.to(dtype=self.readwrite_dtype)
+            delta = torch.einsum("hk,bthv->btkv", wf, vf)
+            out = xf + delta
+        return out.to(dtype=X.dtype)
+
+    def forward(
+        self,
+        X: Tensor,
+        memory_states: Optional[Dict[str, Tensor]] = None,
+        update_memories: bool = True,
+        inference_mode: bool = False,
+        cu_seqlens: Optional[Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        packed_cu_seqlens: Optional[Tensor] = None,
+        packed_num_segs: Optional[Tensor] = None,
+        kv_cache: Optional[Dict[str, Tensor]] = None,
+        position_offset: int = 0,
+    ) -> Tuple[Tensor, Dict[str, Tensor], Optional[Dict[str, Tensor]]]:
+        del cu_seqlens, max_seqlen
+        B, S, _, _ = X.shape
+
+        q = self._read_heads(X, self.r_q)
+        k = self._read_heads(X, self.r_k)
+        v = self._read_heads(X, self.r_v)
+
+        new_states: Dict[str, Tensor] = {}
+        if self.k_memory is not None:
+            k_mem = memory_states.get("k") if memory_states else None
+            k_flat, new_k_mem = self.k_memory(
+                k.reshape(B, S, -1),
+                k_mem,
+                inference_mode=inference_mode,
+                update_memory=update_memories,
+            )
+            k = k_flat.view(B, S, self.n_kv_heads, self.dv)
+            new_states["k"] = new_k_mem
+        if self.v_memory is not None:
+            v_mem = memory_states.get("v") if memory_states else None
+            v_flat, new_v_mem = self.v_memory(
+                v.reshape(B, S, -1),
+                v_mem,
+                inference_mode=inference_mode,
+                update_memory=update_memories,
+            )
+            v = v_flat.view(B, S, self.n_kv_heads, self.dv)
+            new_states["v"] = new_v_mem
+
+        total_seq_len = position_offset + S
+        cos, sin = self.rotary(q, total_seq_len)
+        cos = cos[position_offset:position_offset + S].unsqueeze(0)
+        sin = sin[position_offset:position_offset + S].unsqueeze(0)
+
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+
+        q_rope = q.view(B * self.n_heads, S, self.dv)
+        k_rope = k.view(B * self.n_kv_heads, S, self.dv)
+        q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos, sin)
+        q = q_rope.view(B, self.n_heads, S, self.dv)
+        k = k_rope.view(B, self.n_kv_heads, S, self.dv)
+
+        new_kv_cache: Optional[Dict[str, Tensor]] = None
+        if kv_cache is not None:
+            if "k" in kv_cache:
+                k = torch.cat([kv_cache["k"], k], dim=2)
+                v = torch.cat([kv_cache["v"], v], dim=2)
+            new_kv_cache = {"k": k, "v": v}
+
+        kv_seq_len = k.shape[2]
+
+        if self.n_rep > 1:
+            k = k.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_heads, kv_seq_len, self.dv)
+            v = v.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_heads, kv_seq_len, self.dv)
+
+        mask = None
+        if kv_cache is None:
+            if packed_cu_seqlens is not None:
+                mask = _build_batch_packed_mask(packed_cu_seqlens, packed_num_segs, S, X.device)
+            else:
+                mask = torch.triu(torch.ones(S, kv_seq_len, device=X.device, dtype=torch.bool), diagonal=1)
+        else:
+            mask = _causal_mask_with_cache(S_q=S, S_k=kv_seq_len, device=X.device, position_offset=position_offset)
+
+        scale = 1.0 / math.sqrt(self.dv)
+        device_type = X.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            qf = q.float()
+            kf = k.float()
+            vf = v.float()
+            attn = torch.matmul(qf, kf.transpose(-2, -1)) * float(scale)
+            if mask.dim() == 2:
+                attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            else:
+                attn = attn.masked_fill(mask.unsqueeze(1), float("-inf"))
+            attn = F.softmax(attn, dim=-1)
+            attn = F.dropout(attn, p=self.config.attention_dropout, training=self.training)
+            out = torch.matmul(attn, vf).to(dtype=X.dtype)
+
+        out = out.transpose(1, 2).contiguous()  # [B, T, H, Dv]
+        X_new = self._write_heads(X, self.w_o, out)
+        return X_new, new_states, new_kv_cache
+
+
+class RMTFFN(nn.Module):
+    """
+    Matrix FFN:
+    - read R vectors from X -> [B, T, R, Dv]
+    - FF core over [B, T, R*Dv]
+    - write back via learned write keys
+    """
+
+    def __init__(self, config: OnyxConfig):
+        super().__init__()
+        self.config = config
+        self.r = int(config.rmt_heads or config.n_heads)
+        self.dk = int(config.rmt_dk)
+        self.dv = int(config.rmt_dv)
+        self.readwrite_dtype = _rmt_dtype_from_name(config.rmt_readwrite_dtype)
+
+        self.r_ff = nn.Parameter(torch.empty(self.r, self.dk))
+        self.w_ff = nn.Parameter(torch.empty(self.r, self.dk))
+        _rmt_init_param_(self.r_ff, config.rmt_init)
+        _rmt_init_param_(self.w_ff, config.rmt_init)
+
+        in_dim = self.r * self.dv
+        if int(config.rmt_ff_dim) > 0:
+            hidden = int(config.rmt_ff_dim)
+        else:
+            hidden = max(1, int(round(in_dim * float(config.rmt_ff_multiplier))))
+        self.core = SwiGLUFFN(in_dim, hidden, config.dropout)
+
+    def forward(self, X: Tensor) -> Tensor:
+        device_type = X.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            xf = X.to(dtype=self.readwrite_dtype)
+            rf = self.r_ff.to(device=X.device, dtype=self.readwrite_dtype)
+            reads_f = torch.einsum("rk,btkv->btrv", rf, xf)
+        reads = reads_f.to(dtype=X.dtype)
+        flat = reads.reshape(reads.shape[0], reads.shape[1], -1)
+        out = self.core(flat).view(reads.shape[0], reads.shape[1], self.r, self.dv)
+        with torch.autocast(device_type=device_type, enabled=False):
+            wf = self.w_ff.to(device=X.device, dtype=self.readwrite_dtype)
+            outf = out.to(dtype=self.readwrite_dtype)
+            delta = torch.einsum("rk,btrv->btkv", wf, outf)
+            y = xf + delta
+        return y.to(dtype=X.dtype)
+
+
+class RMTBlock(nn.Module):
+    def __init__(self, config: OnyxConfig, layer_idx: int = 0):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.r = int(config.rmt_heads or config.n_heads)
+        self.dk = int(config.rmt_dk)
+        self.dv = int(config.rmt_dv)
+        self.view_dim = self.r * self.dv
+
+        self.norm1 = RMSNorm(self.view_dim, eps=config.norm_eps)
+        self.norm2 = RMSNorm(self.view_dim, eps=config.norm_eps)
+        self.norm_w1 = nn.Parameter(torch.empty(self.r, self.dk))
+        self.norm_w2 = nn.Parameter(torch.empty(self.r, self.dk))
+        _rmt_init_param_(self.norm_w1, config.rmt_init)
+        _rmt_init_param_(self.norm_w2, config.rmt_init)
+
+        self.attention = RMTAttention(config, layer_idx=layer_idx)
+        self.ffn = RMTFFN(config)
+
+    def _token_view(self, X: Tensor) -> Tensor:
+        # Reuse FF read keys as a stable token view basis.
+        return torch.einsum("rk,btkv->btrv", self.ffn.r_ff.to(dtype=X.dtype), X)
+
+    def init_memory_states(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> Dict[str, Any]:
+        if hasattr(self.attention, "init_memory_states"):
+            return {"attention": self.attention.init_memory_states(batch_size, device, dtype)}
+        return {}
+
+    def get_memory_reg_loss(self, memory_states: Dict[str, Any]) -> Tensor:
+        if hasattr(self.attention, "get_memory_reg_loss") and "attention" in memory_states:
+            return self.attention.get_memory_reg_loss(memory_states["attention"])
+        return torch.tensor(0.0, device=next(self.parameters()).device)
+
+    def forward(
+        self,
+        X: Tensor,
+        memory_states: Optional[Dict[str, Any]] = None,
+        update_memories: bool = True,
+        inference_mode: bool = False,
+        cu_seqlens: Optional[Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        packed_cu_seqlens: Optional[Tensor] = None,
+        packed_num_segs: Optional[Tensor] = None,
+        kv_cache: Optional[Dict[str, Any]] = None,
+        position_offset: int = 0,
+    ) -> Tuple[Tensor, Dict[str, Any], Optional[Dict[str, Any]]]:
+        attn_mem = memory_states.get("attention", {}) if memory_states else {}
+
+        v1 = self._token_view(X).reshape(X.shape[0], X.shape[1], self.view_dim)
+        n1 = self.norm1(v1).view(X.shape[0], X.shape[1], self.r, self.dv)
+        X = X + torch.einsum("rk,btrv->btkv", self.norm_w1.to(dtype=X.dtype), n1)
+
+        X, new_attn_mem, new_kv = self.attention(
+            X,
+            memory_states=attn_mem,
+            update_memories=update_memories,
+            inference_mode=inference_mode,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            packed_cu_seqlens=packed_cu_seqlens,
+            packed_num_segs=packed_num_segs,
+            kv_cache=kv_cache.get("kv", None) if kv_cache else None,
+            position_offset=position_offset,
+        )
+
+        v2 = self._token_view(X).reshape(X.shape[0], X.shape[1], self.view_dim)
+        n2 = self.norm2(v2).view(X.shape[0], X.shape[1], self.r, self.dv)
+        X = X + torch.einsum("rk,btrv->btkv", self.norm_w2.to(dtype=X.dtype), n2)
+        X = self.ffn(X)
+
+        new_states = {"attention": new_attn_mem} if new_attn_mem else {}
+        new_cache = {"kv": new_kv} if new_kv else None
+        return X, new_states, new_cache
+
+
 class HopeBlock(nn.Module):
     def __init__(self, config: OnyxConfig, layer_idx: int = 0):
         super().__init__()
@@ -928,20 +1256,51 @@ class Onyx(nn.Module):
     def __init__(self, config: OnyxConfig):
         super().__init__()
         self.config = config
+        self.use_rmt = bool(config.use_rmt)
+        self.rmt_heads = int(config.rmt_heads or config.n_heads)
+        self.rmt_dk = int(config.rmt_dk)
+        self.rmt_dv = int(config.rmt_dv)
 
-        self.embed = nn.Embedding(config.vocab_size, config.d_model)
-        self.embed_dropout = nn.Dropout(config.dropout)
+        if self.use_rmt:
+            if self.rmt_heads != int(config.n_heads):
+                raise ValueError("RMT currently requires rmt_heads == n_heads.")
+            if self.rmt_dk < 1 or self.rmt_dv < 1:
+                raise ValueError("RMT requires rmt_dk >= 1 and rmt_dv >= 1.")
+            if self.rmt_dv % 2 != 0:
+                raise ValueError("RMT requires rmt_dv to be even for rotary embedding.")
 
-        self.layers = nn.ModuleList([HopeBlock(config, layer_idx=i) for i in range(config.n_layers)])
-        self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
+            self.embed = nn.Embedding(config.vocab_size, config.d_model)
+            self.embed_dropout = nn.Dropout(config.dropout)
+            self.rmt_in_proj = nn.Linear(config.d_model, self.rmt_dk * self.rmt_dv, bias=False)
+            self.layers = nn.ModuleList([RMTBlock(config, layer_idx=i) for i in range(config.n_layers)])
 
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        if config.tie_embeddings:
-            self.lm_head.weight = self.embed.weight
+            self.rmt_readout = nn.Parameter(torch.empty(self.rmt_heads, self.rmt_dk))
+            _rmt_init_param_(self.rmt_readout, config.rmt_init)
+            self.rmt_out_proj = nn.Linear(self.rmt_heads * self.rmt_dv, config.d_model, bias=False)
+            self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
+
+            self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+            if config.tie_embeddings:
+                self.lm_head.weight = self.embed.weight
+        else:
+            self.embed = nn.Embedding(config.vocab_size, config.d_model)
+            self.embed_dropout = nn.Dropout(config.dropout)
+
+            self.layers = nn.ModuleList([HopeBlock(config, layer_idx=i) for i in range(config.n_layers)])
+            self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
+
+            self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+            if config.tie_embeddings:
+                self.lm_head.weight = self.embed.weight
 
         self._init_weights()
         self.gradient_checkpointing = config.gradient_checkpointing
         self._memory_update_count = 0
+
+    def _rmt_to_logits_input(self, X: Tensor) -> Tensor:
+        view = torch.einsum("rk,btkv->btrv", self.rmt_readout.to(dtype=X.dtype), X)
+        vec = view.reshape(X.shape[0], X.shape[1], -1)
+        return self.rmt_out_proj(vec)
 
     def _init_weights(self):
         std = 0.02
@@ -1031,6 +1390,10 @@ class Onyx(nn.Module):
         x = self.embed(input_ids)
         x = self.embed_dropout(x)
 
+        X = None
+        if self.use_rmt:
+            X = self.rmt_in_proj(x).view(B, S, self.rmt_dk, self.rmt_dv)
+
         if memory_states is None:
             memory_states = [None] * len(self.layers)
         if kv_cache is None:
@@ -1044,22 +1407,31 @@ class Onyx(nn.Module):
 
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
-                x, new_mem, new_kv = torch.utils.checkpoint.checkpoint(
-                    layer, x, memory_states[i], update_memories, inference_mode,
+                layer_in = X if self.use_rmt else x
+                layer_out, new_mem, new_kv = torch.utils.checkpoint.checkpoint(
+                    layer, layer_in, memory_states[i], update_memories, inference_mode,
                     cu_seqlens, max_seqlen, packed_cu_seqlens, packed_num_segs, kv_cache[i], position_offset,
                     use_reentrant=False,
                 )
             else:
-                x, new_mem, new_kv = layer(
-                    x, memory_states[i], update_memories, inference_mode,
+                layer_in = X if self.use_rmt else x
+                layer_out, new_mem, new_kv = layer(
+                    layer_in, memory_states[i], update_memories, inference_mode,
                     cu_seqlens, max_seqlen, packed_cu_seqlens, packed_num_segs, kv_cache[i], position_offset,
                 )
+            if self.use_rmt:
+                X = layer_out
+            else:
+                x = layer_out
             new_memory_states.append(new_mem)
             new_kv_cache.append(new_kv)
 
         if update_memories:
             self._memory_update_count += S
 
+        if self.use_rmt:
+            assert X is not None
+            x = self._rmt_to_logits_input(X)
         x = self.norm(x)
         logits = self.lm_head(x)
 
@@ -1278,7 +1650,6 @@ def create_onyx(**kwargs) -> Onyx:
 
 def get_param_groups(model: Onyx, weight_decay: float = 0.1, memory_lr_scale: float = 0.1):
     decay_params, no_decay_params, memory_params = [], [], []
-    embed_params = []
     mixer_params = []
     seen = set()
 
@@ -1294,7 +1665,8 @@ def get_param_groups(model: Onyx, weight_decay: float = 0.1, memory_lr_scale: fl
             continue
 
         if "embed" in name or "lm_head" in name:
-            add_unique(embed_params, param)
+            # Keep embeddings in the no-decay bucket for stable defaults.
+            add_unique(no_decay_params, param)
             continue
 
         if "mixers." in name:
@@ -1316,8 +1688,6 @@ def get_param_groups(model: Onyx, weight_decay: float = 0.1, memory_lr_scale: fl
         {"params": no_decay_params, "weight_decay": 0.0},
         {"params": memory_params, "weight_decay": 0.0, "lr_scale": memory_lr_scale},
     ]
-    if embed_params:
-        groups.append({"params": embed_params, "weight_decay": 0.0, "m3_mode": "vector"})
     if mixer_params:
         groups.append({"params": mixer_params, "weight_decay": 0.0, "m3_mode": "vector"})
     return groups

@@ -1,11 +1,17 @@
 {
-    "d_model": 64,
-    "n_layers": 1,
-    "n_heads": 1,
-    "n_kv_heads": 1,
-    "d_ff": 192,
+    "d_model": 768,
+    "n_layers": 16,
+    "n_heads": 12,
+    "n_kv_heads": 2,
+    "d_ff": 2048,
     "vocab_size": 32168,
     "max_seq_len": 2048,
     "rope_base": 500000.0,
-    "norm_eps": 1e-05
+    "norm_eps": 1e-05,
+    "use_rmt": true,
+    "rmt_dk": 64,
+    "rmt_dv": 64,
+    "rmt_heads": 12,
+    "rmt_ff_multiplier": 2.0,
+    "rmt_readwrite_dtype": "float32"
 }

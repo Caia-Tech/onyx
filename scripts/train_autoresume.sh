@@ -26,6 +26,12 @@ PEAK_LR="${PEAK_LR:-1e-4}"
 MIN_LR="${MIN_LR:-2e-5}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.002}"
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.05}"
+EXPERIMENTAL_MHC="${EXPERIMENTAL_MHC:-1}"
+MHC_N="${MHC_N:-4}"
+MHC_MODE="${MHC_MODE:-mhc}"
+MHC_SINKHORN="${MHC_SINKHORN:-1}"
+MHC_SINKHORN_ITERS="${MHC_SINKHORN_ITERS:-10}"
+EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 LOCK_DIR="${CKPT_DIR}/.train_autoresume.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 
@@ -99,12 +105,26 @@ BASE_CMD=(
   --max_mps_alloc_gb 14
   --auto_interrupt_on_mem
   --dataset_state_mode light
-  --experimental_mhc
-  --mhc_n 2
-  --mhc_mode mhc
-  --mhc_sinkhorn_iters 10
   --no-init_strict
 )
+
+if [[ "$EXPERIMENTAL_MHC" == "1" ]]; then
+  BASE_CMD+=(--experimental_mhc)
+  BASE_CMD+=(--mhc_n "$MHC_N")
+  BASE_CMD+=(--mhc_mode "$MHC_MODE")
+  if [[ "$MHC_SINKHORN" == "1" ]]; then
+    BASE_CMD+=(--mhc_sinkhorn)
+  else
+    BASE_CMD+=(--no-mhc_sinkhorn)
+  fi
+  BASE_CMD+=(--mhc_sinkhorn_iters "$MHC_SINKHORN_ITERS")
+fi
+
+if [[ -n "$EXTRA_TRAIN_ARGS" ]]; then
+  # shellcheck disable=SC2206
+  EXTRA_ARR=($EXTRA_TRAIN_ARGS)
+  BASE_CMD+=("${EXTRA_ARR[@]}")
+fi
 
 RETRY_DELAY_SEC=5
 MAX_SAME_CKPT_FAILURES=2
