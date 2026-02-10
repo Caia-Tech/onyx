@@ -303,14 +303,22 @@ def load_model(
         mhc_sinkhorn_iters = int(
             mhc_sinkhorn_iters if mhc_sinkhorn_iters is not None else train_cfg.get("mhc_sinkhorn_iters", 10)
         )
-        print(
-            "[Experimental] Using OnyxMHC mhc_n={n} mhc_mode={mode} sinkhorn={sinkhorn} iters={iters}".format(
-                n=mhc_n,
-                mode=mhc_mode,
-                sinkhorn=mhc_sinkhorn,
-                iters=mhc_sinkhorn_iters,
+        if mhc_mode == "mhc_lite":
+            print(
+                "[Experimental] Using OnyxMHC mhc_n={n} mhc_mode={mode} (sinkhorn flags ignored in mhc_lite)".format(
+                    n=mhc_n,
+                    mode=mhc_mode,
+                )
             )
-        )
+        else:
+            print(
+                "[Experimental] Using OnyxMHC mhc_n={n} mhc_mode={mode} sinkhorn={sinkhorn} iters={iters}".format(
+                    n=mhc_n,
+                    mode=mhc_mode,
+                    sinkhorn=mhc_sinkhorn,
+                    iters=mhc_sinkhorn_iters,
+                )
+            )
         model = OnyxMHC(
             config,
             mhc_n=mhc_n,
@@ -651,7 +659,7 @@ def main():
     # Experimental: load OnyxMHC checkpoints (matches --experimental_mhc training)
     parser.add_argument("--experimental_mhc", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--mhc_n", type=int, default=None)
-    parser.add_argument("--mhc_mode", type=str, choices=["mhc", "hc"], default=None)
+    parser.add_argument("--mhc_mode", type=str, choices=["mhc", "hc", "mhc_lite"], default=None)
     parser.add_argument("--mhc_sinkhorn", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--mhc_sinkhorn_iters", type=int, default=None)
 

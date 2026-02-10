@@ -1448,14 +1448,22 @@ class Trainer:
         )
 
         if cfg.experimental_mhc:
-            self._log(
-                "[Experimental] Using OnyxMHC mhc_n={n} mhc_mode={mode} sinkhorn={sinkhorn} iters={iters}".format(
-                    n=cfg.mhc_n,
-                    mode=cfg.mhc_mode,
-                    sinkhorn=cfg.mhc_sinkhorn,
-                    iters=cfg.mhc_sinkhorn_iters,
+            if cfg.mhc_mode == "mhc_lite":
+                self._log(
+                    "[Experimental] Using OnyxMHC mhc_n={n} mhc_mode={mode} (sinkhorn flags ignored in mhc_lite)".format(
+                        n=cfg.mhc_n,
+                        mode=cfg.mhc_mode,
+                    )
                 )
-            )
+            else:
+                self._log(
+                    "[Experimental] Using OnyxMHC mhc_n={n} mhc_mode={mode} sinkhorn={sinkhorn} iters={iters}".format(
+                        n=cfg.mhc_n,
+                        mode=cfg.mhc_mode,
+                        sinkhorn=cfg.mhc_sinkhorn,
+                        iters=cfg.mhc_sinkhorn_iters,
+                    )
+                )
             self.model = OnyxMHC(
                 model_config,
                 mhc_n=cfg.mhc_n,
@@ -2519,7 +2527,7 @@ def main():
     p.add_argument("--mhc_n", type=int, default=2)
     p.add_argument("--mhc_sinkhorn", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mhc_sinkhorn_iters", type=int, default=10)
-    p.add_argument("--mhc_mode", type=str, choices=["mhc", "hc"], default="mhc")
+    p.add_argument("--mhc_mode", type=str, choices=["mhc", "hc", "mhc_lite"], default="mhc")
     p.add_argument("--mhc_debug_finite_checks", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--mhc_debug_every", type=int, default=0)
 

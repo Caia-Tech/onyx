@@ -1,5 +1,5 @@
 import torch
-from onyx.experimental.mhc import sinkhorn_project, MHCMixer
+from onyx.experimental.mhc import sinkhorn_project, MHCMixer, MHCLiteMixer
 
 
 def test_sinkhorn_stress_logits_finite():
@@ -40,6 +40,21 @@ def test_mhc_mixer_train_steps_no_nan():
     opt = torch.optim.SGD(mixer.parameters(), lr=1e-2)
     for _ in range(20):
         x = torch.randn(2, 4, 2, 8)
+        out = mixer(x)
+        loss = out.float().pow(2).mean()
+        assert torch.isfinite(loss).all()
+        opt.zero_grad()
+        loss.backward()
+        assert all(p.grad is None or torch.isfinite(p.grad).all() for p in mixer.parameters())
+        opt.step()
+
+
+def test_mhc_lite_mixer_train_steps_no_nan():
+    torch.manual_seed(0)
+    mixer = MHCLiteMixer(n_streams=3)
+    opt = torch.optim.SGD(mixer.parameters(), lr=1e-2)
+    for _ in range(20):
+        x = torch.randn(2, 4, 3, 8)
         out = mixer(x)
         loss = out.float().pow(2).mean()
         assert torch.isfinite(loss).all()

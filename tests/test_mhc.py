@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from onyx.experimental import OnyxMHC
-from onyx.experimental.mhc import sinkhorn_project, MHCMixer
+from onyx.experimental.mhc import sinkhorn_project, MHCMixer, MHCLiteMixer
 from onyx.model import Onyx, OnyxConfig, M3Optimizer, get_param_groups
 
 
@@ -61,6 +61,18 @@ def test_mhc_shapes():
     torch.manual_seed(0)
     config = _tiny_config()
     model = OnyxMHC(config, mhc_n=2, mhc_mode="mhc", mhc_sinkhorn=True, mhc_sinkhorn_iters=5)
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+    labels = torch.randint(0, config.vocab_size, (2, 8))
+    out = model(input_ids, labels=labels)
+    assert out["logits"].shape == (2, 8, config.vocab_size)
+    assert out["loss"] is not None
+    assert out["loss"].ndim == 0
+
+
+def test_mhc_lite_shapes():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    model = OnyxMHC(config, mhc_n=2, mhc_mode="mhc_lite")
     input_ids = torch.randint(0, config.vocab_size, (2, 8))
     labels = torch.randint(0, config.vocab_size, (2, 8))
     out = model(input_ids, labels=labels)
@@ -136,6 +148,21 @@ def test_mhc_mixer_no_nan_and_nonnegative():
         assert torch.allclose(col_sum, ones_col, atol=1e-3, rtol=1e-3)
 
         opt.step()
+
+
+def test_mhc_lite_mixer_doubly_stochastic():
+    torch.manual_seed(0)
+    mixer = MHCLiteMixer(n_streams=3)
+    streams = torch.randn(2, 4, 3, 8)
+    out = mixer(streams)
+    assert torch.isfinite(out).all()
+    p_used = mixer._mix_matrix()
+    assert torch.isfinite(p_used).all()
+    assert p_used.min().item() >= -1e-8
+    row_sum = p_used.sum(dim=-1)
+    col_sum = p_used.sum(dim=-2)
+    assert torch.allclose(row_sum, torch.ones_like(row_sum), atol=1e-4, rtol=1e-4)
+    assert torch.allclose(col_sum, torch.ones_like(col_sum), atol=1e-4, rtol=1e-4)
 
 
 def test_onyxmhc_no_nan_smoke_cpu():

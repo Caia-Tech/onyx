@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from onyx.model import OnyxConfig, HopeBlock, RMSNorm, RMTBlock
-from onyx.experimental.mhc import MHCMixer, aggregate_streams, scatter_delta
+from onyx.experimental.mhc import MHCMixer, MHCLiteMixer, aggregate_streams, scatter_delta
 
 
 class OnyxMHC(nn.Module):
@@ -32,8 +32,8 @@ class OnyxMHC(nn.Module):
         super().__init__()
         if mhc_n < 1:
             raise ValueError("mhc_n must be >= 1")
-        if mhc_mode not in ("mhc", "hc"):
-            raise ValueError(f"mhc_mode must be 'mhc' or 'hc', got {mhc_mode}")
+        if mhc_mode not in ("mhc", "hc", "mhc_lite"):
+            raise ValueError(f"mhc_mode must be 'mhc', 'hc', or 'mhc_lite', got {mhc_mode}")
 
         self.config = config
         self.use_rmt = bool(config.use_rmt)
@@ -62,17 +62,20 @@ class OnyxMHC(nn.Module):
             self.layers = nn.ModuleList([RMTBlock(config, layer_idx=i) for i in range(config.n_layers)])
         else:
             self.layers = nn.ModuleList([HopeBlock(config, layer_idx=i) for i in range(config.n_layers)])
-        self.mixers = nn.ModuleList(
-            [
-                MHCMixer(
-                    self.mhc_n,
-                    mode=self.mhc_mode,
-                    use_sinkhorn=self.mhc_sinkhorn,
-                    sinkhorn_iters=self.mhc_sinkhorn_iters,
-                )
-                for _ in range(config.n_layers)
-            ]
-        )
+        if self.mhc_mode == "mhc_lite":
+            self.mixers = nn.ModuleList([MHCLiteMixer(self.mhc_n) for _ in range(config.n_layers)])
+        else:
+            self.mixers = nn.ModuleList(
+                [
+                    MHCMixer(
+                        self.mhc_n,
+                        mode=self.mhc_mode,
+                        use_sinkhorn=self.mhc_sinkhorn,
+                        sinkhorn_iters=self.mhc_sinkhorn_iters,
+                    )
+                    for _ in range(config.n_layers)
+                ]
+            )
         self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)

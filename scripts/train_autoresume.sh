@@ -9,10 +9,11 @@ fi
 
 BASE_DIR="/Users/owner/Desktop/caiatech/models/onyx"
 DATA_GLOB="${DATA_GLOB:-/Users/owner/Desktop/caiatech/datasets/datamix.shuffled.jsonl}"
+TOKENIZER_DIR="${TOKENIZER_DIR:-/Users/owner/Desktop/caiatech/datasets/tokenizers/onyx_tokenizer_32k}"
 SHUFFLE_BUFFER_DOCS="${SHUFFLE_BUFFER_DOCS:-2048}"
-MODEL_CONFIG="${MODEL_CONFIG:-${BASE_DIR}/configs/onyx.json}"
-RUN_NAME="${RUN_NAME:-onyx_64d_1l_mhc_shuf}"
-CKPT_DIR="${CKPT_DIR:-${BASE_DIR}/checkpoints/onyx_64d_1l_mhc_shuf}"
+MODEL_CONFIG="${MODEL_CONFIG:-${BASE_DIR}/configs/onyx_mac_rmt_mhc_lite_4m.json}"
+RUN_NAME="${RUN_NAME:-onyx_mac_rmt_mhc_lite_4m}"
+CKPT_DIR="${CKPT_DIR:-${BASE_DIR}/checkpoints/onyx_mac_rmt_mhc_lite_4m}"
 VAST_CKPT_DIR="${VAST_CKPT_DIR:-}"
 VAST_CKPT="${VAST_CKPT:-}"
 INIT_CKPT="${INIT_CKPT:-}"
@@ -25,10 +26,17 @@ MEM_REPORT_EVERY="${MEM_REPORT_EVERY:-100}"
 PEAK_LR="${PEAK_LR:-1e-4}"
 MIN_LR="${MIN_LR:-2e-5}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.002}"
-LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.05}"
+LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.0}"
+TRAIN_TOKENS_TARGET="${TRAIN_TOKENS_TARGET:-300000000}"
+MAX_STEPS="${MAX_STEPS:-}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
+TOKENS_PER_STEP="${TOKENS_PER_STEP:-16384}"
+SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-500}"
+USE_AMP="${USE_AMP:-0}"
 EXPERIMENTAL_MHC="${EXPERIMENTAL_MHC:-1}"
-MHC_N="${MHC_N:-4}"
-MHC_MODE="${MHC_MODE:-mhc}"
+MHC_N="${MHC_N:-2}"
+MHC_MODE="${MHC_MODE:-mhc_lite}"
 MHC_SINKHORN="${MHC_SINKHORN:-1}"
 MHC_SINKHORN_ITERS="${MHC_SINKHORN_ITERS:-10}"
 EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
@@ -49,7 +57,7 @@ if [[ ! -e "$DATA_GLOB" ]]; then
   echo "DATA_GLOB not found: $DATA_GLOB" >&2
   exit 2
 fi
-if [[ ! -d "/Users/owner/Desktop/caiatech/datasets/tokenizers/onyx_tokenizer_32k" ]]; then
+if [[ ! -d "$TOKENIZER_DIR" ]]; then
   echo "Tokenizer dir not found" >&2
   exit 2
 fi
@@ -79,21 +87,20 @@ trap cleanup_lock EXIT
 BASE_CMD=(
   python -m onyx.train
   --data_glob "$DATA_GLOB"
-  --tokenizer "/Users/owner/Desktop/caiatech/datasets/tokenizers/onyx_tokenizer_32k"
+  --tokenizer "$TOKENIZER_DIR"
   --model_config "$MODEL_CONFIG"
-  --batch_size 4
-  --max_seq_len 2048
-  --tokens_per_step 16384
+  --batch_size "$BATCH_SIZE"
+  --max_seq_len "$MAX_SEQ_LEN"
+  --tokens_per_step "$TOKENS_PER_STEP"
   --shuffle_buffer_docs "$SHUFFLE_BUFFER_DOCS"
   --num_epochs 1
   --learning_rate "$PEAK_LR"
   --min_lr "$MIN_LR"
   --warmup_ratio "$WARMUP_RATIO"
   --label_smoothing "$LABEL_SMOOTHING"
-  --no-amp
   --save_dir "$CKPT_DIR"
-  --save_every_steps 500
-  --train_tokens_target 7536720684
+  --save_every_steps "$SAVE_EVERY_STEPS"
+  --train_tokens_target "$TRAIN_TOKENS_TARGET"
   --log_every "$LOG_EVERY"
   --monitor_every "$MONITOR_EVERY"
   --alert_effective_vocab "$ALERT_EFFECTIVE_VOCAB"
@@ -107,6 +114,15 @@ BASE_CMD=(
   --dataset_state_mode light
   --no-init_strict
 )
+
+if [[ "$USE_AMP" == "1" ]]; then
+  BASE_CMD+=(--amp)
+else
+  BASE_CMD+=(--no-amp)
+fi
+if [[ -n "$MAX_STEPS" ]]; then
+  BASE_CMD+=(--max_steps "$MAX_STEPS")
+fi
 
 if [[ "$EXPERIMENTAL_MHC" == "1" ]]; then
   BASE_CMD+=(--experimental_mhc)
